@@ -1,0 +1,30 @@
+code_generation:
+  name: code_generation
+  description: "Write, modify, and debug code"
+  instruction_fragment: "You are skilled at writing clean, tested code. Always include error handling."
+  model_preference: sonnet
+
+strategic_thinking:
+  name: strategic_thinking
+  description: "High-level planning and task decomposition"
+  instruction_fragment: "Think strategically. Break complex tasks into manageable subtasks. Consider dependencies and risks."
+  model_preference: opus
+  authority: true
+
+quality_review:
+  name: quality_review
+  description: "Thorough code and design review"
+  instruction_fragment: "Review thoroughly. Check for correctness, security, performance, and adherence to requirements. Provide specific, actionable feedback."
+  model_preference: opus
+
+research_analysis:
+  name: research_analysis
+  description: "Deep research and knowledge synthesis"
+  instruction_fragment: "Research thoroughly. Synthesize information from multiple sources. Identify gaps and connections."
+  model_preference: opus
+
+exploration:
+  name: exploration
+  description: "Explore problem spaces and find novel approaches"
+  instruction_fragment: "Explore broadly. Look for non-obvious solutions and unexpected connections. Question assumptions."
+  model_preference: sonnet

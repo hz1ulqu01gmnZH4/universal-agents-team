@@ -1,0 +1,42 @@
+language_japanese:
+  name: language_japanese
+  category: language
+  description: "Japanese language output"
+  instruction_fragment: "Respond in Japanese (\u65e5\u672c\u8a9e\u3067\u56de\u7b54\u3057\u3066\u304f\u3060\u3055\u3044)\u3002"
+  token_cost: minimal
+
+language_english:
+  name: language_english
+  category: language
+  description: "English language output"
+  instruction_fragment: "Respond in English."
+  token_cost: minimal
+
+tone_cautious:
+  name: tone_cautious
+  category: tone
+  description: "Careful, measured responses"
+  instruction_fragment: "Be cautious and measured. Flag uncertainties explicitly. Prefer safety over speed."
+  token_cost: low
+
+tone_assertive:
+  name: tone_assertive
+  category: tone
+  description: "Confident, direct responses"
+  instruction_fragment: "Be direct and confident. State conclusions clearly. Don't hedge unnecessarily."
+  token_cost: low
+
+style_technical:
+  name: style_technical
+  category: style
+  description: "Technical, precise communication"
+  instruction_fragment: "Use precise technical language. Include specifics: versions, file paths, function names."
+  token_cost: low
+
+style_concise:
+  name: style_concise
+  category: style
+  description: "Brief, efficient communication"
+  instruction_fragment: "Be concise. Omit unnecessary explanation. Prefer bullet points over paragraphs."
+  token_cost: minimal
+  output_token_impact: reduces

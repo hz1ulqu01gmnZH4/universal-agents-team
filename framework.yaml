@@ -1,0 +1,9 @@
+framework:
+  name: universal-agents
+  version: 0.1.0
+  phase: "0"
+  active_domain: meta
+  max_concurrent_agents: 5
+  topology_patterns:
+    - solo
+    - hierarchical_team
