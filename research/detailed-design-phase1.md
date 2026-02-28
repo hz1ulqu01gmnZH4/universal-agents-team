@@ -170,7 +170,7 @@ class TeamMember(FrameworkModel):
     """A member of an agent team."""
     agent_id: str
     role: str
-    status: str  # References AgentStatus value
+    status: AgentStatus  # Validated enum, not bare str
     assigned_subtask: str | None = None
 
 
@@ -187,13 +187,22 @@ class Team(IdentifiableModel):
     subtask_assignments: dict[str, str] = {}  # subtask_id -> agent_id
 
 
+class SubTaskStatus(StrEnum):
+    """SubTask lifecycle states."""
+    PENDING = "pending"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNASSIGNED = "unassigned"
+
+
 class SubTask(IdentifiableModel):
     """A decomposed subtask within a team."""
     parent_task_id: str
     title: str
     description: str
     assigned_to: str | None = None  # agent_id
-    status: str = "pending"  # pending, executing, completed, failed
+    status: SubTaskStatus = SubTaskStatus.PENDING
     result: str | None = None
     token_usage: int = 0
 ```
@@ -238,11 +247,13 @@ class AgentMessage(TimestampedModel):
 Add review enforcement fields:
 
 ```python
-# Add to existing Task class:
+# Add to existing Task class.
+# CRITICAL: FrameworkModel uses extra="forbid", so these fields MUST be added to
+# the actual Task class in Wave 1 BEFORE any code in Waves 3-5 references them.
+# Without these fields, setting task.team_id would raise ValidationError.
 class Task(IdentifiableModel):
     # ... existing fields ...
     team_id: str | None = None           # NEW: Team managing this task
-    review_required: bool = True          # NEW: Axiom A7 enforcement (always True)
     subtasks: list[str] = []             # NEW: SubTask IDs for decomposed work
 ```
 
@@ -264,8 +275,9 @@ The existing `TaskAnalysis` and `RoutingResult` models in `topology_router.py` a
 Add one new model for LLM analysis context:
 
 ```python
+# NOT used in Phase 1 — placeholder for Phase 2 LLM-based analysis.
 class AnalysisContext(FrameworkModel):
-    """Context provided to LLM for task analysis."""
+    """Context provided to LLM for task analysis (Phase 2+)."""
     task_title: str
     task_description: str
     available_roles: list[str]
@@ -290,7 +302,7 @@ Phase 1 replaces the hardcoded analysis with **structured heuristic analysis** (
 
 **BREAKING API CHANGE**: `analyze()` signature changes from `(task_description: str, hints: dict | None)` to `(task: Task)`. All callers must be updated. Phase 0 tests (`test_topology_router.py`) that call `analyze("description", None)` must be rewritten to pass a `Task` object.
 
-Similarly, `route()` is unchanged in signature: `(analysis: TaskAnalysis, available_capacity: ComputeMetrics | None = None)` but now has richer heuristic logic.
+**BREAKING API CHANGE**: `route()` signature changes from `(analysis: TaskAnalysis, available_capacity: ComputeMetrics | None = None)` to `(analysis: TaskAnalysis)`. Resource checking now uses the instance's `resource_tracker` internally instead of an explicit parameter. All callers must be updated.
 
 The class also gains `__init__` (Phase 0 had no constructor — class was stateless).
 
@@ -304,15 +316,24 @@ class TopologyRouter:
     Phase 2+: LLM judgment + MAP-Elites archive lookup.
 
     BREAKING CHANGES from Phase 0:
-    - __init__ now requires (yaml_store, resource_tracker)
+    - __init__ now requires (yaml_store, resource_tracker, domain, audit_logger)
     - analyze() signature: (task: Task) instead of (task_description: str, hints: dict | None)
+    - route() signature: (analysis: TaskAnalysis) instead of (analysis, available_capacity)
+      Resource checking moved to instance's resource_tracker.
     - Phase 0 test updates required: test_topology_router.py
     """
 
-    def __init__(self, yaml_store: YamlStore, resource_tracker: ResourceTracker, domain: str = "meta"):
+    def __init__(
+        self,
+        yaml_store: YamlStore,
+        resource_tracker: ResourceTracker,
+        domain: str = "meta",
+        audit_logger: AuditLogger | None = None,
+    ):
         self.yaml_store = yaml_store
         self.resource_tracker = resource_tracker
         self._tasks_base = f"instances/{domain}/state/tasks"
+        self.audit_logger = audit_logger
 
     def analyze(self, task: Task) -> TaskAnalysis:
         """Analyze task along 6 dimensions using structured heuristics.
@@ -419,8 +440,12 @@ class TopologyRouter:
                     union = title_words | past_words
                     similarity = len(intersection) / len(union)  # Jaccard
                     max_similarity = max(max_similarity, similarity)
-            except Exception:
-                continue  # Best-effort novelty check: skip unreadable task files
+            except Exception as e:
+                import logging
+                logging.getLogger("uagents.topology_router").debug(
+                    f"Skipping unreadable task file {task_file} in novelty check: {e}"
+                )
+                continue
 
         if max_similarity > 0.7:
             return Novelty.ROUTINE
@@ -439,9 +464,22 @@ class TopologyRouter:
 
         All topologies include a mandatory reviewer agent.
         """
-        # Check available resources
-        can_spawn, _ = self.resource_tracker.can_spawn_agent()
+        # Check available resources for topology downgrade decisions
+        can_spawn, spawn_reason = self.resource_tracker.can_spawn_agent()
         metrics = self.resource_tracker.check_compute()
+
+        # Resource-constrained: force solo if unable to spawn
+        if not can_spawn:
+            return RoutingResult(
+                pattern="solo",
+                agent_count=2,
+                role_assignments=[
+                    {"role": "implementer", "model": "sonnet", "purpose": "execute task"},
+                    {"role": "reviewer", "model": "sonnet", "purpose": "mandatory review"},
+                ],
+                inject_scout=False,
+                rationale=f"Resource-constrained ({spawn_reason}) → forced solo with mandatory review",
+            )
 
         # Solo: simple, small, monolithic tasks
         if (analysis.decomposability == Decomposability.MONOLITHIC
@@ -456,7 +494,8 @@ class TopologyRouter:
                     {"role": "reviewer", "model": "sonnet", "purpose": "mandatory review"},
                 ],
                 inject_scout=False,
-                rationale=f"Monolithic + small + {analysis.novelty.value} → solo with mandatory review",
+                # Use str() not .value — Pydantic use_enum_values=True may store raw string
+                rationale=f"Monolithic + small + {analysis.novelty} → solo with mandatory review",
             )
 
         # Parallel swarm: decomposable + independent subtasks
@@ -466,9 +505,9 @@ class TopologyRouter:
             base_count = 3 if analysis.scale == Scale.SMALL else 4
             if analysis.scale == Scale.LARGE:
                 base_count = 5
-            # Cap by resources: at most (max_agents - active_agents - 1 for reviewer)
-            agent_cap = max(2, metrics.active_agents + base_count + 1)
-            actual_count = min(base_count, 6)  # Hard cap at 6 workers
+            # Cap by resources: max_concurrent (10) - active_agents - 2 (orchestrator + reviewer)
+            resource_cap = max(1, 10 - metrics.active_agents - 2)
+            actual_count = min(base_count, 6, resource_cap)  # Hard cap at 6, resource cap
 
             roles = [{"role": "orchestrator", "model": "opus", "purpose": "decompose and aggregate"}]
             for i in range(actual_count):
@@ -542,6 +581,8 @@ def _log_routing_decision(
     DecisionLogEntry fields: decision_type, actor, options_considered, selected, rationale
     (NOT inputs/output — those don't exist on the model).
     """
+    if not self.audit_logger:
+        return
     entry = DecisionLogEntry(
         id=generate_id("dec"),
         timestamp=datetime.utcnow(),
@@ -587,6 +628,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from ..audit.logger import AuditLogger
 from ..models.agent import AgentRegistryEntry, AgentStatus
 from ..models.base import generate_id
 from ..models.capability import CapabilityAtom, ModelPreference
@@ -746,7 +788,7 @@ class TeamManager:
                 title=desc["title"],
                 description=desc["description"],
                 assigned_to=worker.agent_id if worker else None,
-                status="pending" if worker else "unassigned",
+                status=SubTaskStatus.PENDING if worker else SubTaskStatus.UNASSIGNED,
             )
             subtasks.append(subtask)
 
@@ -819,7 +861,7 @@ class TeamManager:
         from ..models.role import RoleComposition
         data = self.yaml_store.read_raw(f"roles/compositions/{role_name}.yaml")
         role_data = data.get("role", data)
-        return RoleComposition(**role_data)
+        return RoleComposition.model_validate(role_data)
 
     def _pattern_to_coordination(self, pattern: TopologyPattern) -> CoordinationMode:
         """Map topology pattern to coordination mode."""
@@ -920,7 +962,7 @@ spawn_agent(role_name, task, team_id) ->
   11. Estimate token cost from composed prompt
   12. Generate agent ID via generate_id("agent")
   13. Create AgentRegistryEntry with team_name, subtask_id
-  14. Persist to state/agents/{agent_id}/status.yaml
+  14. Persist to instances/{domain}/state/agents/{agent_id}/status.yaml
   15. Return (AgentRegistryEntry, ComposedPrompt) — caller invokes Claude Code Task tool
 ```
 
@@ -1220,9 +1262,9 @@ instead of looping back to PLANNING.
 ### 6.1 Current State (Phase 0)
 
 Phase 0 has basic park/resume in TaskLifecycle:
-- `park()` transitions to PARKED status, moves YAML to `state/tasks/parked/`
+- `park()` transitions to PARKED status, moves YAML to `instances/{domain}/state/tasks/parked/`
 - `resume()` transitions back to PLANNING
-- Focus tracking via `state/tasks/focus.yaml`
+- Focus tracking via `instances/{domain}/state/tasks/focus.yaml` (field: `focus_task_id`)
 
 ### 6.2 Phase 1 Enhancements
 
@@ -1385,7 +1427,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from ..audit.logger import AuditLogger
 from ..models.base import generate_id
+from ..models.capability import ModelPreference
 from ..models.task import Task, TaskStatus
 from ..models.team import SubTask, Team, TeamStatus
 from ..state.yaml_store import YamlStore
@@ -1654,7 +1698,7 @@ Task(
     name=f"{agent_entry.role}-{agent_entry.id}",
     prompt=rendered_prompt,
     team_name=team.id,
-    model=agent_entry.model.value,  # "opus", "sonnet", "haiku"
+    model=str(agent_entry.model),  # "opus", "sonnet", "haiku" — use str() not .value (use_enum_values)
     mode="bypassPermissions",
 )
 """
