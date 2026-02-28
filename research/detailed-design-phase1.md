@@ -288,18 +288,31 @@ The Phase 0 `TopologyRouter` returns hardcoded defaults:
 
 Phase 1 replaces the hardcoded analysis with **structured heuristic analysis** (not full LLM judgment — that comes in Phase 2 with MAP-Elites). The analysis uses task description keywords, size estimation, and available resource state.
 
+**BREAKING API CHANGE**: `analyze()` signature changes from `(task_description: str, hints: dict | None)` to `(task: Task)`. All callers must be updated. Phase 0 tests (`test_topology_router.py`) that call `analyze("description", None)` must be rewritten to pass a `Task` object.
+
+Similarly, `route()` is unchanged in signature: `(analysis: TaskAnalysis, available_capacity: ComputeMetrics | None = None)` but now has richer heuristic logic.
+
+The class also gains `__init__` (Phase 0 had no constructor — class was stateless).
+
 ```python
 class TopologyRouter:
     """Task analysis and topology routing.
 
-    Phase 0: Hardcoded defaults.
+    Phase 0: Hardcoded defaults, stateless class.
     Phase 1: Heuristic-enhanced analysis with keyword extraction, resource awareness.
+             Constructor requires yaml_store and resource_tracker.
     Phase 2+: LLM judgment + MAP-Elites archive lookup.
+
+    BREAKING CHANGES from Phase 0:
+    - __init__ now requires (yaml_store, resource_tracker)
+    - analyze() signature: (task: Task) instead of (task_description: str, hints: dict | None)
+    - Phase 0 test updates required: test_topology_router.py
     """
 
-    def __init__(self, yaml_store: YamlStore, resource_tracker: ResourceTracker):
+    def __init__(self, yaml_store: YamlStore, resource_tracker: ResourceTracker, domain: str = "meta"):
         self.yaml_store = yaml_store
         self.resource_tracker = resource_tracker
+        self._tasks_base = f"instances/{domain}/state/tasks"
 
     def analyze(self, task: Task) -> TaskAnalysis:
         """Analyze task along 6 dimensions using structured heuristics.
@@ -389,7 +402,8 @@ class TopologyRouter:
         """Check task history for similar tasks using word overlap."""
         title_words = set(title.lower().split())
         try:
-            completed_dir = "state/tasks/completed"
+            # Use domain-scoped path: instances/{domain}/state/tasks/completed
+            completed_dir = f"{self._tasks_base}/completed"
             completed_tasks = self.yaml_store.list_dir(completed_dir)
         except (NotADirectoryError, FileNotFoundError):
             return Novelty.NOVEL  # No history → novel
@@ -406,7 +420,7 @@ class TopologyRouter:
                     similarity = len(intersection) / len(union)  # Jaccard
                     max_similarity = max(max_similarity, similarity)
             except Exception:
-                continue
+                continue  # Best-effort novelty check: skip unreadable task files
 
         if max_similarity > 0.7:
             return Novelty.ROUTINE
@@ -436,9 +450,10 @@ class TopologyRouter:
             return RoutingResult(
                 pattern="solo",
                 agent_count=2,  # worker + reviewer (A7: review always mandatory)
+                # role_assignments include both 'model' (Phase 0 format) and 'purpose' (Phase 1)
                 role_assignments=[
-                    {"role": "implementer", "purpose": "execute task"},
-                    {"role": "reviewer", "purpose": "mandatory review"},
+                    {"role": "implementer", "model": "sonnet", "purpose": "execute task"},
+                    {"role": "reviewer", "model": "sonnet", "purpose": "mandatory review"},
                 ],
                 inject_scout=False,
                 rationale=f"Monolithic + small + {analysis.novelty.value} → solo with mandatory review",
@@ -455,10 +470,10 @@ class TopologyRouter:
             agent_cap = max(2, metrics.active_agents + base_count + 1)
             actual_count = min(base_count, 6)  # Hard cap at 6 workers
 
-            roles = [{"role": "orchestrator", "purpose": "decompose and aggregate"}]
+            roles = [{"role": "orchestrator", "model": "opus", "purpose": "decompose and aggregate"}]
             for i in range(actual_count):
-                roles.append({"role": "implementer", "purpose": f"parallel worker {i+1}"})
-            roles.append({"role": "reviewer", "purpose": "mandatory review"})
+                roles.append({"role": "implementer", "model": "sonnet", "purpose": f"parallel worker {i+1}"})
+            roles.append({"role": "reviewer", "model": "sonnet", "purpose": "mandatory review"})
 
             return RoutingResult(
                 pattern="parallel_swarm",
@@ -477,12 +492,12 @@ class TopologyRouter:
         if analysis.scale == Scale.LARGE and analysis.quality_criticality == QualityCriticality.CRITICAL:
             team_size = 5  # orchestrator + 3 workers + reviewer
 
-        roles = [{"role": "orchestrator", "purpose": "strategic coordination"}]
+        roles = [{"role": "orchestrator", "model": "opus", "purpose": "strategic coordination"}]
         worker_count = team_size - 2  # minus orchestrator and reviewer
         for i in range(worker_count):
             role_name = self._select_worker_role(analysis, i)
-            roles.append({"role": role_name, "purpose": f"worker {i+1}"})
-        roles.append({"role": "reviewer", "purpose": "mandatory review"})
+            roles.append({"role": role_name, "model": "sonnet", "purpose": f"worker {i+1}"})
+        roles.append({"role": "reviewer", "model": "sonnet", "purpose": "mandatory review"})
 
         return RoutingResult(
             pattern="hierarchical_team",
@@ -522,16 +537,24 @@ from ..models.audit import DecisionLogEntry
 def _log_routing_decision(
     self, task: Task, analysis: TaskAnalysis, result: RoutingResult
 ) -> None:
-    """Log topology routing decision for audit trail."""
+    """Log topology routing decision for audit trail.
+
+    DecisionLogEntry fields: decision_type, actor, options_considered, selected, rationale
+    (NOT inputs/output — those don't exist on the model).
+    """
     entry = DecisionLogEntry(
         id=generate_id("dec"),
         timestamp=datetime.utcnow(),
         stream=LogStream.DECISIONS,
         decision_type="topology_routing",
-        inputs={"task_id": task.id, "analysis": analysis.model_dump()},
-        output=result.model_dump(),
-        rationale=result.rationale,
         actor="topology_router",
+        options_considered=[
+            {"pattern": "solo", "analysis": analysis.model_dump()},
+            {"pattern": "parallel_swarm", "analysis": analysis.model_dump()},
+            {"pattern": "hierarchical_team", "analysis": analysis.model_dump()},
+        ],
+        selected=result.pattern,
+        rationale=result.rationale,
     )
     self.audit_logger.log_decision(entry)
 ```
@@ -539,6 +562,19 @@ def _log_routing_decision(
 ---
 
 ## Part 4: Agent Spawning & Team Management
+
+### 4.0 Path Convention — IMPORTANT
+
+Phase 0 scopes all state under `instances/{domain}/`:
+- TaskLifecycle: `self._tasks_base = f"instances/{domain}/state/tasks"`
+- AgentSpawner: `self._agents_base = f"instances/{domain}/state/agents"`
+
+Phase 1 modules MUST follow this convention. All new modules accept `domain: str` and construct base paths as `f"instances/{domain}/state/..."`:
+- TeamManager: `self._teams_base = f"instances/{domain}/state/teams"`
+- ReviewEngine: uses TaskLifecycle paths (already correct)
+- Orchestrator: delegates to TaskLifecycle and TeamManager (already correct)
+
+All code examples below use `self._teams_base`, `self._tasks_base` etc. instead of bare `state/...` paths.
 
 ### 4.1 Team Manager (`engine/team_manager.py`) — NEW
 
@@ -589,11 +625,15 @@ class TeamManager:
         agent_spawner: AgentSpawner,
         capabilities: dict[str, CapabilityAtom],
         voice_atoms: dict[str, VoiceAtom],
+        domain: str = "meta",
+        audit_logger: AuditLogger | None = None,
     ):
         self.yaml_store = yaml_store
         self.agent_spawner = agent_spawner
         self.capabilities = capabilities
         self.voice_atoms = voice_atoms
+        self._teams_base = f"instances/{domain}/state/teams"
+        self.audit_logger = audit_logger
 
     def create_team(
         self,
@@ -629,7 +669,7 @@ class TeamManager:
         )
 
         # Persist team record
-        team_dir = f"state/teams/{team_id}"
+        team_dir = f"{self._teams_base}/{team_id}"
         self.yaml_store.write(f"{team_dir}/team.yaml", team)
 
         # Spawn each agent
@@ -714,7 +754,7 @@ class TeamManager:
                 team.subtask_assignments[subtask_id] = worker.agent_id
 
         # Persist subtasks
-        team_dir = f"state/teams/{team.id}"
+        team_dir = f"{self._teams_base}/{team.id}"
         for st in subtasks:
             self.yaml_store.write(f"{team_dir}/subtasks/{st.id}.yaml", st)
 
@@ -725,7 +765,7 @@ class TeamManager:
         team = self._load_team(team_id)
         team.status = new_status
         team.updated_at = datetime.utcnow()
-        self.yaml_store.write(f"state/teams/{team_id}/team.yaml", team)
+        self.yaml_store.write(f"{self._teams_base}/{team_id}/team.yaml", team)
         return team
 
     def dissolve_team(self, team_id: str, reason: str) -> None:
@@ -743,28 +783,36 @@ class TeamManager:
                 member.status = AgentStatus.DESPAWNED
 
         team.status = TeamStatus.DISSOLVED
-        self.yaml_store.write(f"state/teams/{team_id}/team.yaml", team)
+        self.yaml_store.write(f"{self._teams_base}/{team_id}/team.yaml", team)
 
     def get_active_teams(self) -> list[Team]:
         """List all non-dissolved teams."""
         teams = []
         try:
-            team_dirs = self.yaml_store.list_dir("state/teams")
+            team_dirs = self.yaml_store.list_dir(self._teams_base)
         except (NotADirectoryError, FileNotFoundError):
             return teams
         for team_dir in team_dirs:
             try:
-                data = self.yaml_store.read_raw(f"state/teams/{team_dir}/team.yaml")
+                data = self.yaml_store.read_raw(f"{self._teams_base}/{team_dir}/team.yaml")
                 if data.get("status") != TeamStatus.DISSOLVED:
-                    teams.append(Team(**data))
-            except Exception:
+                    teams.append(Team.model_validate(data))
+            except Exception as e:
+                import logging
+                logging.getLogger("uagents.team_manager").warning(
+                    f"Failed to load team from {team_dir}: {e}"
+                )
                 continue
         return teams
 
     def _load_team(self, team_id: str) -> Team:
-        """Load team from YAML store."""
-        data = self.yaml_store.read_raw(f"state/teams/{team_id}/team.yaml")
-        return Team(**data)
+        """Load team from YAML store.
+
+        Uses model_validate() instead of Team(**data) to properly validate
+        through Pydantic (handles nested models, type coercion, etc.).
+        """
+        data = self.yaml_store.read_raw(f"{self._teams_base}/{team_id}/team.yaml")
+        return Team.model_validate(data)
 
     def _load_role(self, role_name: str) -> RoleComposition:
         """Load a role composition from YAML."""
@@ -815,23 +863,26 @@ def spawn_for_team(
         entry.current_task = f"{task.id}:{subtask.id}"
 
     # Update persisted entry
-    agent_dir = f"state/agents/{entry.id}"
+    agent_dir = f"{self._agents_base}/{entry.id}"
     self.yaml_store.write(f"{agent_dir}/status.yaml", entry)
     return entry, composed
 
 def update_heartbeat(self, agent_id: str) -> None:
     """Update agent's heartbeat timestamp."""
-    agent_dir = f"state/agents/{agent_id}"
+    agent_dir = f"{self._agents_base}/{agent_id}"
     try:
         data = self.yaml_store.read_raw(f"{agent_dir}/status.yaml")
         data["heartbeat_at"] = datetime.utcnow().isoformat()
         self.yaml_store.write_raw(f"{agent_dir}/status.yaml", data)
     except FileNotFoundError:
-        pass  # Agent already despawned
+        import logging
+        logging.getLogger("uagents.agent_spawner").warning(
+            f"Cannot update heartbeat for {agent_id} — agent file not found (already despawned?)"
+        )
 
 def check_agent_health(self, agent_id: str, timeout_minutes: int = 10) -> bool:
     """Check if agent is responsive (heartbeat within timeout)."""
-    agent_dir = f"state/agents/{agent_id}"
+    agent_dir = f"{self._agents_base}/{agent_id}"
     try:
         data = self.yaml_store.read_raw(f"{agent_dir}/status.yaml")
         if data.get("status") == AgentStatus.DESPAWNED:
@@ -878,10 +929,11 @@ spawn_agent(role_name, task, team_id) ->
 Phase 1 adds these directories to the scaffold:
 
 ```
-state/
+instances/{domain}/state/         # All state under domain-scoped path
 ├── teams/                        # NEW: Team state
 │   └── {team_id}/
 │       ├── team.yaml             # Team record
+│       ├── snapshot.yaml         # Team snapshot (for park/resume)
 │       └── subtasks/             # Decomposed subtasks
 │           └── {subtask_id}.yaml
 ├── coordination/                 # NEW: Stigmergic coordination
@@ -911,6 +963,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from ..audit.logger import AuditLogger
 from ..models.audit import DecisionLogEntry, LogStream
 from ..models.base import generate_id
 from ..models.task import Task, TaskReview, TaskStatus
@@ -945,9 +998,15 @@ class ReviewEngine:
     # Minimum reviewer confidence to accept
     MIN_CONFIDENCE = 0.3
 
-    def __init__(self, yaml_store: YamlStore, task_lifecycle: TaskLifecycle):
+    def __init__(
+        self,
+        yaml_store: YamlStore,
+        task_lifecycle: TaskLifecycle,
+        audit_logger: AuditLogger | None = None,
+    ):
         self.yaml_store = yaml_store
         self.task_lifecycle = task_lifecycle
+        self.audit_logger = audit_logger
 
     def validate_review_eligible(self, task: Task) -> None:
         """Check that task is ready for review."""
@@ -1013,20 +1072,31 @@ class ReviewEngine:
         # Persist review to task
         self._persist_review(task)
 
-        # Apply verdict
+        # Increment review rounds in task metrics
+        if task.metrics:
+            review_rounds = getattr(task.metrics, "review_rounds", 0)
+            task.metrics.review_rounds = review_rounds + 1
+            # Escalate to human after 3 failed rounds
+            if task.metrics.review_rounds >= 3 and verdict == "fail":
+                raise ReviewViolationError(
+                    f"Task {task_id} has failed review {task.metrics.review_rounds} times. "
+                    f"Escalating to human — automatic re-plan loop limit reached."
+                )
+
+        # Apply verdict — REVIEWING → VERDICT first (mandatory intermediate state)
+        task = self.task_lifecycle.transition(
+            task_id, TaskStatus.VERDICT, reviewer_id,
+            f"Review {verdict}: {'; '.join(findings[:3])}"
+        )
+
         if verdict == "fail":
-            # Failed review: back to PLANNING with feedback
+            # Failed review: VERDICT → PLANNING with feedback
             feedback = "; ".join(findings)
             task = self.task_lifecycle.transition(
                 task_id, TaskStatus.PLANNING, reviewer_id,
-                f"Review FAILED: {feedback}"
+                f"Review FAILED (round {task.metrics.review_rounds if task.metrics else '?'}): {feedback}"
             )
-        else:
-            # Passed: REVIEWING → VERDICT → COMPLETE
-            task = self.task_lifecycle.transition(
-                task_id, TaskStatus.VERDICT, reviewer_id,
-                f"Review {verdict}: {'; '.join(findings[:3])}"
-            )
+        # If pass/pass_with_notes: stays at VERDICT, caller advances to COMPLETE
 
         return task
 
@@ -1036,10 +1106,16 @@ class ReviewEngine:
         return task.review
 
     def _validate_not_self_review(self, task: Task, reviewer_id: str) -> None:
-        """Ensure reviewer didn't also execute the task."""
-        # Check timeline for who executed the task
+        """Ensure reviewer didn't also execute the task.
+
+        Timeline entries use event format "transition:X→Y", not to_status field.
+        We check for agents who transitioned into EXECUTING.
+        We also check team members with worker roles — the reviewer must not have
+        been a worker on this task's team.
+        """
         for entry in task.timeline:
-            if (entry.to_status == TaskStatus.EXECUTING.value
+            # Parse event field: format is "transition:{from}→{to}"
+            if (f"→{TaskStatus.EXECUTING.value}" in entry.event
                     and entry.actor == reviewer_id):
                 raise ReviewViolationError(
                     f"Agent {reviewer_id} cannot review task {task.id} — "
@@ -1047,10 +1123,13 @@ class ReviewEngine:
                 )
 
     def _persist_review(self, task: Task) -> None:
-        """Persist review to task YAML file."""
-        # Find task in active/parked/completed directory
+        """Persist review to task YAML file.
+
+        Uses TaskLifecycle._tasks_base for domain-scoped paths.
+        """
+        tasks_base = self.task_lifecycle._tasks_base
         for subdir in ("active", "parked", "completed"):
-            path = f"state/tasks/{subdir}/{task.id}.yaml"
+            path = f"{tasks_base}/{subdir}/{task.id}.yaml"
             try:
                 self.yaml_store.read_raw(path)
                 # Found it — write updated task
@@ -1102,27 +1181,36 @@ Submit your review using the framework review tool:
 
 ### 5.4 Review Flow Diagram
 
+**IMPORTANT**: REVIEWING can ONLY transition to VERDICT (per VALID_TRANSITIONS).
+VERDICT can transition to COMPLETE or PLANNING. There is NO direct REVIEWING → PLANNING path.
+
 ```
 Task EXECUTING
      │
      ▼
-Task REVIEWING ←─────────────────────┐
-     │                                │
-     ▼                                │
-ReviewEngine.submit_review()          │
-     │                                │
-     ├─── verdict == "fail" ──────────┤
-     │    (back to PLANNING           │
-     │     with feedback)             │
-     │                                │
-     ├─── verdict == "pass" ──────────┤
-     │    or "pass_with_notes"        │
-     ▼                                │
-Task VERDICT                          │
-     │                                │
-     ▼                                │
-Task COMPLETE ─── or ─── PLANNING ────┘
-                  (if additional rounds needed)
+Task REVIEWING
+     │
+     ▼
+ReviewEngine.submit_review()
+     │
+     ▼
+Task VERDICT  ←── always goes through VERDICT first
+     │
+     ├─── verdict == "fail" ──────→ Task PLANNING ──→ (re-execute loop)
+     │    (VERDICT → PLANNING                          │
+     │     with feedback)                              │
+     │                                                 ▼
+     │                                         Task EXECUTING
+     │                                                 │
+     │                                                 ▼
+     │                                         Task REVIEWING (next round)
+     │
+     ├─── verdict == "pass" or "pass_with_notes"
+     ▼
+Task COMPLETE
+
+Note: After 3 failed review rounds, ReviewEngine escalates to human
+instead of looping back to PLANNING.
 ```
 
 ---
@@ -1158,11 +1246,12 @@ def park_with_team(
     task = self._load_task(task_id)
 
     # Snapshot team state before dissolving
+    # Snapshot stored under teams dir, not tasks/parked (avoids conflict with flat parked files)
     if task.team_id:
         team = team_manager._load_team(task.team_id)
         team_snapshot = team.model_dump()
         self.yaml_store.write_raw(
-            f"state/tasks/parked/{task_id}/team_snapshot.yaml",
+            f"{team_manager._teams_base}/{task.team_id}/snapshot.yaml",
             team_snapshot,
         )
         team_manager.dissolve_team(task.team_id, f"Task parked: {reason}")
@@ -1195,10 +1284,14 @@ def resume_with_team(
     task = self.resume(task_id, actor)
     self.set_focus(task_id)
 
-    # Check if task had a team
+    # Check if task had a team (snapshot stored under teams dir)
     new_team = None
-    snapshot_path = f"state/tasks/parked/{task_id}/team_snapshot.yaml"
+    # Reconstruct team_id from task record
+    old_team_id = task.team_id
+    snapshot_path = f"{team_manager._teams_base}/{old_team_id}/snapshot.yaml" if old_team_id else None
     try:
+        if not snapshot_path:
+            raise FileNotFoundError("No team to restore")
         self.yaml_store.read_raw(snapshot_path)
         # Re-analyze and create new team
         analysis = topology_router.analyze(task)
@@ -1206,7 +1299,10 @@ def resume_with_team(
         new_team = team_manager.create_team(task, routing, domain_config)
         task.team_id = new_team.id
     except FileNotFoundError:
-        pass  # No team to restore — solo task
+        import logging
+        logging.getLogger("uagents.task_lifecycle").info(
+            f"No team snapshot found for task {task_id} — resuming as solo task"
+        )
 
     return task, new_team
 
@@ -1217,9 +1313,10 @@ def list_parked_with_details(self) -> list[dict]:
     now = datetime.utcnow()
     for task in parked:
         # Find when it was parked (last timeline entry)
+        # Timeline entries use event format "transition:X→Y"
         parked_at = None
         for entry in reversed(task.timeline):
-            if entry.to_status == TaskStatus.PARKED.value:
+            if f"→{TaskStatus.PARKED.value}" in entry.event:
                 parked_at = entry.time
                 break
 
@@ -1240,12 +1337,19 @@ def list_parked_with_details(self) -> list[dict]:
 
 ```python
 def _clear_focus(self) -> None:
-    """Clear the focus file when task is parked."""
-    focus_path = "state/tasks/focus.yaml"
+    """Clear the focus file when task is parked.
+
+    Phase 0 focus.yaml uses {"focus_task_id": ...} format.
+    Must NOT silently swallow errors — log warning instead (fail-loud policy).
+    """
+    focus_path = f"{self._tasks_base}/focus.yaml"
     try:
-        self.yaml_store.write_raw(focus_path, {"active": None, "parked": []})
-    except Exception:
-        pass
+        self.yaml_store.write_raw(focus_path, {"focus_task_id": None})
+    except Exception as e:
+        import logging
+        logging.getLogger("uagents.task_lifecycle").warning(
+            f"Failed to clear focus file at {focus_path}: {e}"
+        )
 
 def suggest_resume(self) -> str | None:
     """Suggest which parked task to resume based on priority and staleness.
@@ -1316,12 +1420,14 @@ class Orchestrator:
         team_manager: TeamManager,
         task_lifecycle: TaskLifecycle,
         review_engine: ReviewEngine,
+        audit_logger: AuditLogger | None = None,
     ):
         self.yaml_store = yaml_store
         self.topology_router = topology_router
         self.team_manager = team_manager
         self.task_lifecycle = task_lifecycle
         self.review_engine = review_engine
+        self.audit_logger = audit_logger
 
     def process_task(
         self, task_id: str, domain_config, actor: str = "orchestrator"
@@ -1356,13 +1462,20 @@ class Orchestrator:
         )
 
         # 6. Store topology assignment on task
+        # TaskTopology fields: pattern (str), analysis (dict), agents (list[TopologyAssignment])
+        # TopologyAssignment fields: role (str), agent_id (str), model (ModelPreference)
         from ..models.task import TaskTopology, TopologyAssignment
         task.topology = TaskTopology(
-            selected=TopologyAssignment(
-                pattern=routing.pattern,
-                agent_count=routing.agent_count,
-                rationale=routing.rationale,
-            ),
+            pattern=routing.pattern,
+            analysis=analysis.model_dump(),
+            agents=[
+                TopologyAssignment(
+                    role=a["role"],
+                    agent_id="pending",  # Filled when team spawns agents
+                    model=ModelPreference(a.get("model", "sonnet")),
+                )
+                for a in routing.role_assignments
+            ],
         )
 
         # 7. Create team (if not solo pattern — even solo has reviewer)
@@ -1397,10 +1510,11 @@ class Orchestrator:
     ) -> Task:
         """Handle review verdict and transition appropriately.
 
+        ReviewEngine always transitions REVIEWING → VERDICT first.
         If review verdict is "pass" or "pass_with_notes":
-          VERDICT → COMPLETE
+          VERDICT → COMPLETE (handled here)
         If review verdict is "fail":
-          Already handled by ReviewEngine (back to PLANNING)
+          VERDICT → PLANNING (already handled by ReviewEngine.submit_review)
         """
         task = self.task_lifecycle._load_task(task_id)
         if task.review and task.review.verdict in ("pass", "pass_with_notes"):
@@ -1426,8 +1540,8 @@ Decompose this task into subtasks for your team:
 **Task:** {task.title}
 **Description:** {task.description}
 
-**Team size:** {len(task.topology.selected.agent_count if task.topology else 'unknown')} agents
-**Topology:** {task.topology.selected.pattern if task.topology else 'unknown'}
+**Team size:** {len(task.topology.agents) if task.topology else 'unknown'} agents
+**Topology:** {task.topology.pattern if task.topology else 'unknown'}
 
 ### Instructions:
 1. Break the task into 2-5 independent subtasks
@@ -1452,8 +1566,8 @@ role:
   name: orchestrator
   description: "Strategic coordinator — decomposes tasks, selects topology, manages agents"
   capabilities:
-    - deep_analysis
-    - can_spawn_agents
+    - strategic_thinking      # Phase 0 atom (NOT deep_analysis — doesn't exist)
+    - quality_review          # Phase 0 atom (NOT can_spawn_agents — doesn't exist)
   model: opus
   thinking: extended
   behavioral_descriptors:
@@ -1501,13 +1615,13 @@ Human provides task
   │  REVIEWING   │  Reviewer agent examines all artifacts
   └──────┬──────┘
          │
-         ├── fail ──→ PLANNING (with feedback) ──→ loop
-         │
          ▼
   ┌─────────────┐
   │  VERDICT     │  Review recorded, verdict applied
   └──────┬──────┘
          │
+         ├── fail ──→ PLANNING (with feedback) ──→ re-execute loop
+         │             (VERDICT → PLANNING is legal)
          ▼
   ┌─────────────┐
   │  COMPLETE    │  Team dissolved, audit trail complete
@@ -1529,13 +1643,16 @@ The framework produces **spawn descriptors** that map to Claude Code's `Task` to
 descriptor = agent_spawner.spawn(role, task, domain, caps, voice)
 agent_entry, composed_prompt = descriptor
 
-# 2. Claude Code agent invokes Task tool
+# 2. Render the prompt (render() is on PromptComposer, NOT on ComposedPrompt)
+rendered_prompt = prompt_composer.render(composed_prompt)
+
+# 3. Claude Code agent invokes Task tool
 # (This is what the orchestrator agent's CLAUDE.md instructs it to do)
 """
 Task(
     subagent_type="general-purpose",
     name=f"{agent_entry.role}-{agent_entry.id}",
-    prompt=composed_prompt.render(),
+    prompt=rendered_prompt,
     team_name=team.id,
     model=agent_entry.model.value,  # "opus", "sonnet", "haiku"
     mode="bypassPermissions",
@@ -1698,7 +1815,7 @@ def _section_phase1_limitations(self) -> str:
 2. Create `src/uagents/models/message.py` — MessageType, AgentMessage
 3. Modify `src/uagents/models/task.py` — add team_id, review_required, subtasks fields
 4. Modify `src/uagents/models/agent.py` — add heartbeat_at, subtask_id fields
-5. Update `src/uagents/state/directory.py` — add state/teams/ and state/coordination/ dirs
+5. Update `src/uagents/state/directory.py` — add instances/{domain}/state/teams/ and state/coordination/ dirs
 6. Write tests for new models
 
 **Verification:** `uv run pytest tests/test_models/ -v` — all pass, including new model tests
@@ -1818,7 +1935,7 @@ Waves 2, 3, 4 can be partially parallelized since they depend on Wave 1 but are 
 
 - [ ] Run 5 real tasks through the framework and verify complete audit trail
 - [ ] Verify all tasks have reviews in their YAML records
-- [ ] Verify team records in `state/teams/` match expected topology
+- [ ] Verify team records in `instances/{domain}/state/teams/` match expected topology
 - [ ] Verify CLAUDE.md contains Phase 1 orchestration instructions
 - [ ] Verify parked tasks can be resumed and complete successfully
 
