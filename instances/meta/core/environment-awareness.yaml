@@ -1,0 +1,48 @@
+# Environment awareness configuration
+# Spec reference: Section 19 (Environment Awareness & Self-Benchmarking)
+# All thresholds are authoritative — engines read from this file, not hardcoded constants.
+
+environment_awareness:
+
+  canary_suite:
+    # Budget constraints for canary execution
+    max_total_tokens: 5000        # Hard cap: entire suite must use < 5000 tokens
+    max_runtime_seconds: 120      # Hard cap: entire suite must complete in < 2 min
+    per_task_token_cap: 1200      # Soft cap per individual canary task
+    # Scoring thresholds
+    pass_score: 0.7               # Score >= this counts as "passed"
+    # Recency skip: don't re-run if last fingerprint is recent AND version unchanged
+    skip_if_recent_hours: 5       # Hours before canary re-run is needed
+
+  drift_detection:
+    threshold: 0.15               # Euclidean distance > this triggers ENVIRONMENT_CHANGE
+    history_size: 10              # Number of recent fingerprints to store
+    baseline_window: 5            # Use median of last N fingerprints as baseline
+    per_dimension_alert: 0.10     # Per-dimension delta > this flags that dimension
+    periodic_check_interval: 50   # Re-run canaries every N completed tasks
+
+  revalidation:
+    budget_cap_pct: 0.10          # Max fraction of session token budget for revalidation
+    min_budget_tokens: 2000       # Don't revalidate if budget < this (too few to be useful)
+    # Adaptation classification thresholds (MF-4: named to match AdaptationResponse levels)
+    improved_threshold: 0.05      # Mean delta > +5% → IMPROVED
+    degraded_minor_threshold: 0.05  # Mean delta < -5% → DEGRADED_MINOR
+    degraded_major_threshold: 0.15  # Mean delta < -15% → DEGRADED_MAJOR
+    broken_threshold: 0.30          # Mean delta < -30% → BROKEN
+
+  performance_monitoring:
+    skill_window_size: 20         # Rolling window for per-skill success rate
+    skill_alert_drop_pp: 10       # Alert if success_rate drops > 10 percentage points
+    tool_alert_drop_pp: 15        # Alert if tool success_rate drops > 15pp
+    tool_quarantine_threshold: 0.5  # Quarantine tool if success_rate < 50%
+    trace_retention_tasks: 100    # Keep traces for last N tasks
+
+  self_benchmarking:
+    full_suite_interval: 100      # Run full benchmark every N completed tasks
+    quick_suite_interval: 20      # Run quick benchmark every N completed tasks
+    quick_suite_tasks: 3          # Number of tasks in quick suite (first 3 of full)
+
+  version_tracking:
+    check_on_session_start: true  # Always check claude --version at session start
+    version_command: "claude --version"
+    version_timeout_seconds: 5

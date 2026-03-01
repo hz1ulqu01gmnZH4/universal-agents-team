@@ -1,0 +1,101 @@
+# Fixed canary suite expected outputs
+# WARNING: These values must NEVER be changed. They are the ruler, not the subject.
+# Changing canary expectations invalidates all historical fingerprint comparisons.
+# Spec reference: Section 19.1 (Model Fingerprinting)
+
+canary_expectations:
+
+  reasoning:
+    prompt: |
+      Solve this logic puzzle step by step:
+      There are 3 boxes. Box A contains only apples. Box B contains only bananas.
+      Box C contains a mix of apples and bananas. All labels are WRONG.
+      You pick one fruit from Box C and it is an apple.
+      What does each box actually contain?
+    expected_answer: "Box C has apples, Box A has bananas, Box B has the mix"
+    scoring:
+      method: "keyword_match"
+      required_keywords:
+        - "C"
+        - "apples"
+        - "A"
+        - "bananas"
+        - "B"
+        - "mix"
+      min_keywords: 5  # Must match at least 5 of 6 keywords
+
+  instruction_following:
+    prompt: |
+      Follow these instructions exactly:
+      1. Start your response with the word "RESPONSE"
+      2. List exactly 3 colors, one per line, numbered 1-3
+      3. Each color must be a single word
+      4. End your response with the word "DONE"
+      5. Do not include any other text
+    expected_answer: "RESPONSE\n1. <color>\n2. <color>\n3. <color>\nDONE"
+    scoring:
+      method: "constraint_check"
+      # MF-1: Named constraint checkers replace eval() expressions.
+      # Each constraint specifies a `checker` (key in CONSTRAINT_CHECKERS)
+      # and an `arg` (value passed to the checker function).
+      constraints:
+        - name: "starts_with_response"
+          checker: "starts_with"
+          arg: "RESPONSE"
+        - name: "ends_with_done"
+          checker: "ends_with"
+          arg: "DONE"
+        - name: "has_three_numbered"
+          checker: "regex_count_eq"
+          arg:
+            pattern: "^\\d+\\."
+            count: 3
+        - name: "no_extra_text"
+          checker: "line_count_le"
+          arg: 6
+
+  code_generation:
+    prompt: |
+      Write a Python function called `fibonacci` that takes an integer n
+      and returns the nth Fibonacci number (0-indexed, so fibonacci(0)=0,
+      fibonacci(1)=1, fibonacci(6)=8). Use iteration, not recursion.
+      Return ONLY the function, no explanation.
+    expected_answer: "def fibonacci(n):"
+    scoring:
+      method: "code_validation"
+      test_cases:
+        - input: 0
+          expected: 0
+        - input: 1
+          expected: 1
+        - input: 6
+          expected: 8
+        - input: 10
+          expected: 55
+
+  creative_divergence:
+    prompt: |
+      List exactly 5 unusual uses for a paperclip. Each use must be
+      a single sentence. Number them 1-5.
+    expected_answer: "5 distinct creative uses"
+    scoring:
+      method: "diversity_score"
+      min_items: 5
+      uniqueness_threshold: 0.3  # Pairwise TF-IDF distance must be > 0.3
+
+  tool_use:
+    prompt: |
+      I need you to perform these steps in order:
+      1. Calculate 17 * 23
+      2. Report the result as: "RESULT: <number>"
+      3. State whether the result is prime or composite as: "TYPE: <prime|composite>"
+    expected_answer: "RESULT: 391\nTYPE: composite"
+    scoring:
+      method: "exact_fields"
+      fields:
+        - name: "result"
+          pattern: "RESULT:\\s*(\\d+)"
+          expected: "391"
+        - name: "type"
+          pattern: "TYPE:\\s*(\\w+)"
+          expected: "composite"
