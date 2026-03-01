@@ -1,0 +1,107 @@
+# Skill system configuration
+# Spec reference: Section 12 (Skill Lifecycle)
+# All thresholds are authoritative -- engines read from this file, not hardcoded constants.
+#
+# Literature basis:
+# - SkillsBench (arXiv:2602.12670): Curated skills +16.2pp
+# - CASCADE (arXiv:2512.23880): 93.3% via execution-based validation
+# - Li et al. 2026: Phase transition at critical library size
+# - SoK Agent Skills (arXiv:2602.20867): 26.1% vulnerability rate
+
+skill_system:
+
+  extraction:
+    # Minimum review confidence to extract skill from a task trajectory
+    min_review_confidence: 0.7
+    # Minimum trajectory length (characters) to consider for extraction
+    min_trajectory_length: 200
+    # Maximum trajectory snippet length stored in SkillSource (characters)
+    max_trajectory_snippet: 2000
+    # Token budget for the extraction LLM call
+    extraction_token_budget: 3000
+    # Verdicts that qualify for extraction
+    qualifying_verdicts:
+      - "pass"
+      - "pass_with_notes"
+    # Cooldown: minimum tasks between extraction attempts for the same task_type
+    # Prevents extracting near-duplicate skills from consecutive similar tasks
+    extraction_cooldown_tasks: 5
+
+  validation:
+    # Total token budget for the entire 4-stage pipeline (Section 12.2)
+    total_token_budget: 15000
+    # Per-stage token budgets
+    stage_budgets:
+      syntax: 0           # Stage 1: No LLM call needed (pure parsing)
+      execution: 6000     # Stage 2: 2 test tasks x ~3000 tokens each
+      comparison: 6000    # Stage 3: A/B test (baseline + with-skill)
+      review: 3000        # Stage 4: Review prompt generation
+    # Stage 2: Minimum number of archived test tasks required
+    min_test_tasks: 2
+    # Stage 3: Minimum improvement (percentage points) required
+    min_improvement_pp: 5
+    # Stage 3: Number of comparison runs per variant (with/without skill)
+    comparison_runs: 2
+    # Stage 4: Who can approve (human or agent with authority capability)
+    review_approvers:
+      - "human"
+      - "authority_agent"
+
+  library:
+    # Capacity limits (Section 12.3) -- Li et al. 2026 phase transition
+    capacity:
+      per_domain: 50      # Maximum active skills per domain
+      per_level: 20       # Maximum active skills per hierarchy level
+    # Storage paths (relative to instance root)
+    skills_dir: "state/skills"
+    candidates_dir: "state/skills/candidates"
+    maintenance_dir: "state/skills/maintenance-history"
+
+  maintenance:
+    # Maintenance period (Section 12.4)
+    period_tasks: 20       # Run maintenance every N completed tasks
+    # Pruning thresholds
+    prune_success_rate: 0.5    # success_rate < this -> deprecated
+    prune_unused_tasks: 30     # unused for N tasks -> deprecated
+    # Merge threshold -- cosine similarity (1 - cosine_distance)
+    merge_similarity_threshold: 0.85
+    # Maximum maintenance records to keep
+    max_maintenance_history: 100
+    # Scoring weights for composite score
+    scoring_weights:
+      usage_frequency: 0.4
+      success_rate: 0.4
+      freshness: 0.2
+
+  ring_transitions:
+    # Ring 3 -> Ring 2 requirements (Section 20.2)
+    ring_3_to_2:
+      min_improvement_pp: 5      # Must demonstrate >= +5pp improvement
+      min_usage_count: 5         # Must have been used at least N times
+      min_success_rate: 0.7      # Must have >= 70% success rate
+      require_full_validation: true  # Must have passed all 4 stages
+    # Ring 2 -> Ring 3 demotion triggers
+    ring_2_to_3:
+      on_revalidation_failure: true   # Demote if post-drift revalidation fails
+      on_success_rate_below: 0.5      # Demote if success_rate drops below this
+    # Ring 0 and Ring 1: human-only, never automated
+    ring_0_immutable: true
+    ring_1_human_only: true
+
+  security:
+    # Injection ordering (Section 12.5)
+    # Skills injected AFTER constitution and safety constraints, never before
+    injection_position: "after_constitution"
+    # Ring 3 skills are sandboxed (Phase 3.5 enforces)
+    ring_3_sandboxed: true
+    # Maximum instruction_fragment length (characters)
+    max_instruction_length: 1500
+    # Forbidden patterns in instruction_fragment
+    # FM-S08: Prevents prompt injection via skill content
+    forbidden_patterns:
+      - "ignore previous instructions"
+      - "ignore all instructions"
+      - "disregard"
+      - "override constitution"
+      - "bypass safety"
+      - "system prompt"
