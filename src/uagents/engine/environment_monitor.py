@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 from ..audit.logger import AuditLogger
 from ..engine.budget_tracker import BudgetTracker
@@ -28,13 +27,9 @@ from ..engine.revalidation_engine import RevalidationEngine
 from ..models.audit import EnvironmentLogEntry
 from ..models.base import generate_id
 from ..models.environment import (
-    AdaptationResponse,
-    DriftDetection,
     EnvironmentCheckResult,
     ModelExecuteFn,
-    ModelFingerprint,
     RevalidationTrigger,
-    VersionInfo,
 )
 from ..state.yaml_store import YamlStore
 
@@ -104,6 +99,9 @@ class EnvironmentMonitor:
         5. Trigger revalidation if drift or version change detected
         6. Log all events to ENVIRONMENT audit stream
 
+        IFM-N18: Top-level try/except prevents session start failures from
+        propagating to caller. Returns a skipped result on error.
+
         Args:
             execute_fn: Model execution function for canary tasks.
                 Signature: (prompt: str, max_tokens: int) -> (output: str, tokens_used: int)
@@ -114,112 +112,121 @@ class EnvironmentMonitor:
         # IFM-09: Store execute_fn for periodic_check() to use later
         self._execute_fn = execute_fn
 
-        result = EnvironmentCheckResult()
+        try:
+            result = EnvironmentCheckResult()
 
-        # Step 1: Version check (zero cost)
-        version_info, version_changes = self.drift_detector.check_version()
-        result.version_info = version_info
-        result.version_changes = version_changes
+            # Step 1: Version check (zero cost)
+            version_info, version_changes = self.drift_detector.check_version()
+            result.version_info = version_info
+            result.version_changes = version_changes
 
-        if version_changes:
+            if version_changes:
+                self._log_event(
+                    "version_change",
+                    {
+                        "changes": version_changes,
+                        "current": version_info.claude_code_version,
+                    },
+                )
+
+            # Step 2: Recency check
+            if not version_changes and not self._should_run_canary():
+                result.skipped = True
+                result.skip_reason = "recent_fingerprint_valid"
+                logger.info(
+                    "Canary suite skipped: recent fingerprint still valid"
+                )
+                self._log_event("canary_skipped", {"reason": result.skip_reason})
+                return result
+
+            # Step 3: Run canary suite
+            logger.info("Running canary suite at session start...")
+            suite_result = self.canary_runner.run_suite(execute_fn)
+            result.fingerprint = suite_result.fingerprint
+            result.canary_all_passed = suite_result.all_passed
+
             self._log_event(
-                "version_change",
+                "fingerprint",
                 {
-                    "changes": version_changes,
-                    "current": version_info.claude_code_version,
+                    "scores": suite_result.task_scores,
+                    "total_tokens": suite_result.total_tokens,
+                    "all_passed": suite_result.all_passed,
                 },
             )
 
-        # Step 2: Recency check
-        if not version_changes and not self._should_run_canary():
-            result.skipped = True
-            result.skip_reason = "recent_fingerprint_valid"
+            # Step 4: Detect drift
+            drift = self.drift_detector.detect_drift(suite_result.fingerprint)
+            result.drift = drift
+            result.drift_detected = drift.drift_detected
+
+            # Store the new fingerprint
+            self.drift_detector.store_fingerprint(suite_result.fingerprint)
+
+            if drift.drift_detected:
+                self._log_event(
+                    "drift",
+                    {
+                        "distance": drift.distance,
+                        "threshold": drift.threshold,
+                        "affected_dimensions": drift.affected_dimensions,
+                    },
+                )
+
+            # Step 5: Trigger revalidation if needed
+            trigger: RevalidationTrigger | None = None
+            trigger_detail = ""
+
+            if drift.drift_detected:
+                trigger = RevalidationTrigger.MODEL_DRIFT
+                trigger_detail = (
+                    f"Drift distance {drift.distance:.4f} > "
+                    f"threshold {drift.threshold}. "
+                    f"Affected: {drift.affected_dimensions}"
+                )
+            elif version_changes:
+                trigger = RevalidationTrigger.VERSION_CHANGE
+                trigger_detail = f"Version changes: {version_changes}"
+
+            if trigger is not None:
+                # IFM-N12: Pass already-computed fingerprint to avoid double canary run
+                reval_result = self.revalidation_engine.run_revalidation(
+                    trigger=trigger,
+                    trigger_detail=trigger_detail,
+                    drift=drift if drift.drift_detected else None,
+                    version_changes=version_changes if version_changes else None,
+                    pre_fingerprint=drift.baseline if drift.drift_detected else None,
+                    execute_fn=execute_fn,
+                    canary_runner=self.canary_runner,
+                    post_fingerprint=suite_result.fingerprint,
+                )
+                result.revalidation_triggered = True
+                result.adaptation = reval_result.adaptation
+
+                self._log_event(
+                    "revalidation",
+                    {
+                        "trigger": str(trigger),
+                        "adaptation": str(reval_result.adaptation),
+                        "scope": reval_result.scope,
+                        "tokens_used": reval_result.tokens_used,
+                        "actions": reval_result.actions_taken,
+                    },
+                )
+
             logger.info(
-                "Canary suite skipped: recent fingerprint still valid"
+                f"Session start check complete: "
+                f"drift={result.drift_detected}, "
+                f"version_changes={result.version_changes}, "
+                f"revalidation={result.revalidation_triggered}"
             )
-            self._log_event("canary_skipped", {"reason": result.skip_reason})
+
             return result
-
-        # Step 3: Run canary suite
-        logger.info("Running canary suite at session start...")
-        suite_result = self.canary_runner.run_suite(execute_fn)
-        result.fingerprint = suite_result.fingerprint
-        result.canary_all_passed = suite_result.all_passed
-
-        self._log_event(
-            "fingerprint",
-            {
-                "scores": suite_result.task_scores,
-                "total_tokens": suite_result.total_tokens,
-                "all_passed": suite_result.all_passed,
-            },
-        )
-
-        # Step 4: Detect drift
-        drift = self.drift_detector.detect_drift(suite_result.fingerprint)
-        result.drift = drift
-        result.drift_detected = drift.drift_detected
-
-        # Store the new fingerprint
-        self.drift_detector.store_fingerprint(suite_result.fingerprint)
-
-        if drift.drift_detected:
-            self._log_event(
-                "drift",
-                {
-                    "distance": drift.distance,
-                    "threshold": drift.threshold,
-                    "affected_dimensions": drift.affected_dimensions,
-                },
+        except Exception as e:
+            logger.error(f"Session start environment check failed: {e}")
+            return EnvironmentCheckResult(
+                skipped=True,
+                skip_reason=f"error: {e}",
             )
-
-        # Step 5: Trigger revalidation if needed
-        trigger: RevalidationTrigger | None = None
-        trigger_detail = ""
-
-        if drift.drift_detected:
-            trigger = RevalidationTrigger.MODEL_DRIFT
-            trigger_detail = (
-                f"Drift distance {drift.distance:.4f} > "
-                f"threshold {drift.threshold}. "
-                f"Affected: {drift.affected_dimensions}"
-            )
-        elif version_changes:
-            trigger = RevalidationTrigger.VERSION_CHANGE
-            trigger_detail = f"Version changes: {version_changes}"
-
-        if trigger is not None:
-            reval_result = self.revalidation_engine.run_revalidation(
-                trigger=trigger,
-                trigger_detail=trigger_detail,
-                drift=drift if drift.drift_detected else None,
-                version_changes=version_changes if version_changes else None,
-                pre_fingerprint=drift.baseline if drift.drift_detected else None,
-                execute_fn=execute_fn,
-                canary_runner=self.canary_runner,  # MF-5: pass for post_fingerprint
-            )
-            result.revalidation_triggered = True
-            result.adaptation = reval_result.adaptation
-
-            self._log_event(
-                "revalidation",
-                {
-                    "trigger": str(trigger),
-                    "adaptation": str(reval_result.adaptation),
-                    "scope": reval_result.scope,
-                    "tokens_used": reval_result.tokens_used,
-                    "actions": reval_result.actions_taken,
-                },
-            )
-
-        logger.info(
-            f"Session start check complete: "
-            f"drift={result.drift_detected}, "
-            f"version_changes={result.version_changes}, "
-            f"revalidation={result.revalidation_triggered}"
-        )
-
-        return result
 
     def periodic_check(
         self, execute_fn: ModelExecuteFn | None = None
@@ -232,6 +239,9 @@ class EnvironmentMonitor:
         IFM-09: Falls back to stored self._execute_fn if execute_fn not
         provided. Checks execute_fn is not None before proceeding.
         IFM-21: Degraded skills now trigger revalidation (not just logging).
+        IFM-N18/N19: Wrapped in try/except/finally to always reset task counter.
+        MF-3/IFM-N05: Passes actual degraded skill names as scope_override.
+        IFM-N12: Passes already-computed fingerprint to avoid double canary run.
 
         Args:
             execute_fn: Model execution function. If None, uses stored
@@ -254,91 +264,101 @@ class EnvironmentMonitor:
             return result
 
         result = EnvironmentCheckResult()
+        try:
+            # Flush pending performance data before check
+            self.performance_monitor.flush()
 
-        # Flush pending performance data before check
-        self.performance_monitor.flush()
-
-        # Run canary suite
-        logger.info(
-            f"Running periodic environment check "
-            f"(interval: {self._periodic_interval} tasks)"
-        )
-        suite_result = self.canary_runner.run_suite(fn)
-        result.fingerprint = suite_result.fingerprint
-        result.canary_all_passed = suite_result.all_passed
-
-        # Detect drift
-        drift = self.drift_detector.detect_drift(suite_result.fingerprint)
-        result.drift = drift
-        result.drift_detected = drift.drift_detected
-
-        # Store fingerprint
-        self.drift_detector.store_fingerprint(suite_result.fingerprint)
-
-        # Collect performance alerts
-        result.alerts = self.performance_monitor.get_pending_alerts()
-
-        # Trigger revalidation on drift
-        if drift.drift_detected:
-            reval_result = self.revalidation_engine.run_revalidation(
-                trigger=RevalidationTrigger.MODEL_DRIFT,
-                trigger_detail=(
-                    f"Periodic check drift: {drift.distance:.4f} > "
-                    f"{drift.threshold}"
-                ),
-                drift=drift,
-                pre_fingerprint=drift.baseline,
-                execute_fn=fn,
-                canary_runner=self.canary_runner,  # MF-5
+            # Run canary suite
+            logger.info(
+                f"Running periodic environment check "
+                f"(interval: {self._periodic_interval} tasks)"
             )
-            result.revalidation_triggered = True
-            result.adaptation = reval_result.adaptation
+            suite_result = self.canary_runner.run_suite(fn)
+            result.fingerprint = suite_result.fingerprint
+            result.canary_all_passed = suite_result.all_passed
 
-            self._log_event(
-                "periodic_revalidation",
-                {
-                    "drift_distance": drift.distance,
-                    "adaptation": str(reval_result.adaptation),
-                },
-            )
+            # Detect drift
+            drift = self.drift_detector.detect_drift(suite_result.fingerprint)
+            result.drift = drift
+            result.drift_detected = drift.drift_detected
 
-        # IFM-21: Degraded skills trigger PERFORMANCE_DROP revalidation
-        degraded = self.performance_monitor.get_degraded_skills()
-        if degraded:
-            skill_names = [s.skill_name for s in degraded]
-            self._log_event(
-                "performance_alert",
-                {
-                    "degraded_skills": skill_names,
-                    "rates": {
-                        s.skill_name: s.success_rate for s in degraded
-                    },
-                },
-            )
+            # Store fingerprint
+            self.drift_detector.store_fingerprint(suite_result.fingerprint)
 
-            # IFM-21: Trigger revalidation for degraded skills
-            if not result.revalidation_triggered:
+            # Collect performance alerts
+            result.alerts = self.performance_monitor.get_pending_alerts()
+
+            # Trigger revalidation on drift
+            if drift.drift_detected:
+                # IFM-N12: Pass already-computed fingerprint to skip canary re-run
                 reval_result = self.revalidation_engine.run_revalidation(
-                    trigger=RevalidationTrigger.PERFORMANCE_DROP,
+                    trigger=RevalidationTrigger.MODEL_DRIFT,
                     trigger_detail=(
-                        f"Degraded skills: {skill_names}"
+                        f"Periodic check drift: {drift.distance:.4f} > "
+                        f"{drift.threshold}"
                     ),
+                    drift=drift,
+                    pre_fingerprint=drift.baseline,
                     execute_fn=fn,
                     canary_runner=self.canary_runner,
+                    post_fingerprint=suite_result.fingerprint,
                 )
                 result.revalidation_triggered = True
                 result.adaptation = reval_result.adaptation
 
                 self._log_event(
-                    "performance_revalidation",
+                    "periodic_revalidation",
                     {
-                        "degraded_skills": skill_names,
+                        "drift_distance": drift.distance,
                         "adaptation": str(reval_result.adaptation),
                     },
                 )
 
-        # Reset task counter
-        self.performance_monitor.reset_task_counter()
+            # IFM-21: Degraded skills trigger PERFORMANCE_DROP revalidation
+            degraded = self.performance_monitor.get_degraded_skills()
+            if degraded:
+                skill_names = [s.skill_name for s in degraded]
+                self._log_event(
+                    "performance_alert",
+                    {
+                        "degraded_skills": skill_names,
+                        "rates": {
+                            s.skill_name: s.success_rate for s in degraded
+                        },
+                    },
+                )
+
+                # IFM-21: Trigger revalidation for degraded skills
+                # MF-3/IFM-N05: Pass actual skill names as scope_override
+                # IFM-N12: Pass already-computed fingerprint
+                if not result.revalidation_triggered:
+                    reval_result = self.revalidation_engine.run_revalidation(
+                        trigger=RevalidationTrigger.PERFORMANCE_DROP,
+                        trigger_detail=(
+                            f"Degraded skills: {skill_names}"
+                        ),
+                        execute_fn=fn,
+                        canary_runner=self.canary_runner,
+                        scope_override=skill_names,
+                        post_fingerprint=suite_result.fingerprint,
+                    )
+                    result.revalidation_triggered = True
+                    result.adaptation = reval_result.adaptation
+
+                    self._log_event(
+                        "performance_revalidation",
+                        {
+                            "degraded_skills": skill_names,
+                            "adaptation": str(reval_result.adaptation),
+                        },
+                    )
+        except Exception as e:
+            logger.error(f"Periodic check failed: {e}")
+            result.skipped = True
+            result.skip_reason = f"error: {e}"
+        finally:
+            # IFM-N18/N19: Always reset task counter, even on error
+            self.performance_monitor.reset_task_counter()
 
         return result
 

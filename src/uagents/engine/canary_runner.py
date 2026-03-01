@@ -246,8 +246,12 @@ class CanaryRunner:
                 tokens_used = 0
             task_elapsed_ms = int((time.monotonic() - task_start) * 1000)
 
-            # Score the output
-            score = self._score_task(task_name, output)
+            # IFM-N10: Score the output, catching scoring exceptions
+            try:
+                score = self._score_task(task_name, output)
+            except Exception as e:
+                logger.warning(f"Canary task '{task_name}' scoring failed: {e}")
+                score = 0.0
             total_tokens += tokens_used
 
             result = CanaryResult(
@@ -337,24 +341,14 @@ class CanaryRunner:
     def _score_keyword_match(output: str, scoring: dict) -> float:
         """Score by counting required keywords present in output.
 
-        Uses word-boundary matching to prevent partial matches
-        (e.g., keyword "A" should not match inside "apples").
+        SF-1: Uses simple substring matching per design doc. Case-insensitive.
         """
         keywords = scoring.get("required_keywords", [])
         min_keywords = scoring.get("min_keywords", len(keywords))
         if not keywords:
             return 0.0
-        matched = 0
-        for kw in keywords:
-            # Use word-boundary matching for single-char keywords,
-            # substring matching for multi-char keywords
-            if len(kw) <= 2:
-                pattern = r'\b' + re.escape(kw) + r'\b'
-                if re.search(pattern, output, re.IGNORECASE):
-                    matched += 1
-            else:
-                if kw.lower() in output.lower():
-                    matched += 1
+        output_lower = output.lower()
+        matched = sum(1 for kw in keywords if kw.lower() in output_lower)
         if matched >= min_keywords:
             return 1.0
         return matched / len(keywords)
@@ -442,6 +436,7 @@ class CanaryRunner:
 
         # Extract numbered items
         items = re.findall(r"^\d+[.)]\s*(.+)$", output, re.MULTILINE)
+        items = items[:20]  # IFM-N20: Cap items to prevent quadratic blowup
         if len(items) < min_items:
             # Partial credit for having some items
             return len(items) / min_items * 0.5
@@ -472,7 +467,10 @@ class CanaryRunner:
 
     @staticmethod
     def _score_exact_fields(output: str, scoring: dict) -> float:
-        """Score by extracting specific fields and comparing to expected values."""
+        """Score by extracting specific fields and comparing to expected values.
+
+        SF-5/IFM-N09: Catches IndexError from patterns without capture groups.
+        """
         fields = scoring.get("fields", [])
         if not fields:
             return 0.0
@@ -481,8 +479,15 @@ class CanaryRunner:
             pattern = field.get("pattern", "")
             expected = field.get("expected", "")
             match = re.search(pattern, output)
-            if match and match.group(1).strip() == expected:
-                matched += 1
+            if match:
+                try:
+                    if match.group(1).strip() == expected:
+                        matched += 1
+                except IndexError:
+                    logger.warning(
+                        f"Pattern has no capture group for field "
+                        f"'{field.get('name', '?')}'"
+                    )
         return matched / len(fields)
 
     def _compute_fingerprint(self, results: list[CanaryResult]) -> ModelFingerprint:

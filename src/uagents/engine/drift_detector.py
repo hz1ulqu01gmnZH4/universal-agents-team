@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -249,8 +250,11 @@ class DriftDetector:
         return current, changes
 
     def check_claude_version(self) -> str:
-        """Get Claude Code version string via subprocess."""
-        parts = self._version_command.split()
+        """Get Claude Code version string via subprocess.
+
+        SF-6: Uses shlex.split() for proper shell quoting support.
+        """
+        parts = shlex.split(self._version_command)
         try:
             result = subprocess.run(
                 parts,

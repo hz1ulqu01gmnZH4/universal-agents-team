@@ -287,51 +287,83 @@ class PerformanceMonitor:
             self._traced_task_ids.append(task_id)
 
     def get_pending_alerts(self) -> list[PerformanceAlert]:
-        """Consume and return pending alerts. Clears the alert queue."""
-        alerts = list(self._pending_alerts)
-        self._pending_alerts.clear()
-        return alerts
+        """Consume and return pending alerts. Clears the alert queue.
+
+        IFM-N01: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            alerts = list(self._pending_alerts)
+            self._pending_alerts.clear()
+            return alerts
 
     def get_skill_performance(self, skill_name: str) -> SkillPerformance | None:
-        """Get performance record for a specific skill."""
-        return self._track.skills.get(skill_name)
+        """Get performance record for a specific skill.
+
+        IFM-N02: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            return self._track.skills.get(skill_name)
 
     def get_tool_performance(self, tool_name: str) -> ToolPerformance | None:
-        """Get performance record for a specific tool."""
-        return self._track.tools.get(tool_name)
+        """Get performance record for a specific tool.
+
+        IFM-N02: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            return self._track.tools.get(tool_name)
 
     def get_all_skill_performances(self) -> dict[str, SkillPerformance]:
-        """Get all skill performance records."""
-        return dict(self._track.skills)
+        """Get all skill performance records.
+
+        IFM-N03: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            return dict(self._track.skills)
 
     def get_all_tool_performances(self) -> dict[str, ToolPerformance]:
-        """Get all tool performance records."""
-        return dict(self._track.tools)
+        """Get all tool performance records.
+
+        IFM-N03: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            return dict(self._track.tools)
 
     def get_degraded_skills(self) -> list[SkillPerformance]:
-        """Get skills whose success rate dropped > alert threshold from baseline."""
-        degraded: list[SkillPerformance] = []
-        for skill in self._track.skills.values():
-            drop = skill.success_rate_drop
-            if drop is not None and drop > self._skill_alert_drop:
-                degraded.append(skill)
-        return sorted(degraded, key=lambda s: s.success_rate)
+        """Get skills whose success rate dropped > alert threshold from baseline.
+
+        IFM-N01: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            degraded: list[SkillPerformance] = []
+            for skill in self._track.skills.values():
+                drop = skill.success_rate_drop
+                if drop is not None and drop > self._skill_alert_drop:
+                    degraded.append(skill)
+            return sorted(degraded, key=lambda s: s.success_rate)
 
     def get_quarantined_tools(self) -> list[ToolPerformance]:
-        """Get tools below quarantine threshold with sufficient data."""
-        quarantined: list[ToolPerformance] = []
-        for tool in self._track.tools.values():
-            if (
-                tool.total_calls >= 10
-                and tool.success_rate < self._tool_quarantine_threshold
-            ):
-                quarantined.append(tool)
-        return quarantined
+        """Get tools below quarantine threshold with sufficient data.
+
+        IFM-N01: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            quarantined: list[ToolPerformance] = []
+            for tool in self._track.tools.values():
+                if (
+                    tool.total_calls >= 10
+                    and tool.success_rate < self._tool_quarantine_threshold
+                ):
+                    quarantined.append(tool)
+            return quarantined
 
     def get_task_count(self) -> int:
         """SF-8: Public getter for tasks-since-last-check counter.
-        Replaces direct access to self._track.tasks_since_last_check."""
-        return self._track.tasks_since_last_check
+        Replaces direct access to self._track.tasks_since_last_check.
+
+        IFM-N03: Guarded by self._lock to prevent race conditions.
+        """
+        with self._lock:
+            return self._track.tasks_since_last_check
 
     def increment_task_counter(self) -> int:
         """Increment and return the tasks-since-last-check counter."""
@@ -341,10 +373,17 @@ class PerformanceMonitor:
             return self._track.tasks_since_last_check
 
     def reset_task_counter(self) -> None:
-        """Reset the tasks-since-last-check counter (after periodic check)."""
+        """Reset the tasks-since-last-check counter (after periodic check).
+
+        IFM-N28: Catches exceptions from _flush_track_unlocked() to prevent
+        persistence failures from blocking the counter reset.
+        """
         with self._lock:
             self._track.tasks_since_last_check = 0
-            self._flush_track_unlocked()
+            try:
+                self._flush_track_unlocked()
+            except Exception as e:
+                logger.warning(f"Failed to persist task counter reset: {e}")
 
     def _load_track(self) -> PerformanceTrack:
         """Load performance track from YAML or create new.

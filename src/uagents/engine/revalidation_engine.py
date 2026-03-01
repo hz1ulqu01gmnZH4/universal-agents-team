@@ -32,7 +32,6 @@ from ..models.environment import (
     ModelFingerprint,
     RevalidationResult,
     RevalidationTrigger,
-    VersionInfo,
 )
 from ..state.yaml_store import YamlStore
 
@@ -256,12 +255,24 @@ class RevalidationEngine:
         pre_fingerprint: ModelFingerprint | None = None,
         execute_fn: ModelExecuteFn | None = None,
         canary_runner: CanaryRunner | None = None,
+        scope_override: list[str] | None = None,
+        post_fingerprint: ModelFingerprint | None = None,
     ) -> RevalidationResult:
         """Execute a full revalidation cycle.
 
         MF-5/IFM-06: Now actually calls execute_fn via canary_runner to produce
         a post_fingerprint for meaningful adaptation classification. Also tracks
         tokens_used from the canary re-run.
+
+        MF-3/IFM-N05: scope_override allows caller to specify exact scope
+        instead of using assess_scope() (e.g., for PERFORMANCE_DROP with
+        actual degraded skill names).
+
+        IFM-N12: post_fingerprint allows caller to pass an already-computed
+        fingerprint, skipping the redundant canary re-run.
+
+        MF-1/IFM-N06: Records token consumption via budget_tracker after
+        canary re-run.
 
         Args:
             trigger: What caused the revalidation.
@@ -271,6 +282,8 @@ class RevalidationEngine:
             pre_fingerprint: Fingerprint before the change.
             execute_fn: Model execution function for re-running canaries.
             canary_runner: CanaryRunner instance for re-running canary suite.
+            scope_override: If provided, use instead of assess_scope().
+            post_fingerprint: If provided, skip canary re-run.
 
         Returns:
             RevalidationResult with classification and actions taken.
@@ -292,19 +305,19 @@ class RevalidationEngine:
             self._store_result(result)
             return result
 
-        # Assess scope
-        scope = self.assess_scope(trigger, drift, version_changes)
+        # MF-3/IFM-N05: Use scope_override if provided, else assess_scope()
+        scope = scope_override if scope_override else self.assess_scope(trigger, drift, version_changes)
 
         # Track tokens used during revalidation
         tokens_used = 0
         actions_taken: list[str] = []
         affected_skills: list[str] = []
-        post_fingerprint: ModelFingerprint | None = None
 
-        # MF-5/IFM-06: Re-run canary suite to get post_fingerprint.
-        # Without this, classify_adaptation() always returns UNCHANGED
-        # because post_fingerprint would be None.
-        if execute_fn is not None and canary_runner is not None:
+        # IFM-N12: If post_fingerprint is already provided, skip canary re-run.
+        # MF-5/IFM-06: Otherwise, re-run canary suite to get post_fingerprint.
+        if post_fingerprint is not None:
+            actions_taken.append("post_fingerprint_provided")
+        elif execute_fn is not None and canary_runner is not None:
             try:
                 suite_result = canary_runner.run_suite(execute_fn)
                 post_fingerprint = suite_result.fingerprint
@@ -312,6 +325,9 @@ class RevalidationEngine:
                 actions_taken.append(
                     f"canary_rerun:tokens={tokens_used}"
                 )
+                # MF-1/IFM-N06: Record token consumption in budget tracker
+                if tokens_used > 0:
+                    self.budget_tracker.record_consumption(tokens_used)
             except Exception as e:
                 logger.warning(
                     f"Canary re-run during revalidation failed: {e}"
