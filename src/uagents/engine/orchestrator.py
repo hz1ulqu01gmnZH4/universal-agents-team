@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .context_pressure_monitor import ContextPressureMonitor
     from .cost_gate import CostGate
     from .diversity_engine import DiversityEngine
+    from .evolution_engine import EvolutionEngine
     from .prompt_composer import PromptComposer
     from .rate_limiter import RateLimiter
     from .ring_enforcer import RingEnforcer
@@ -84,6 +85,8 @@ class Orchestrator:
         tool_loader: ToolLoader | None = None,
         ring_enforcer: RingEnforcer | None = None,
         self_reconfigurer: SelfReconfigurer | None = None,
+        # Phase 4: Evolution engine (optional)
+        evolution_engine: EvolutionEngine | None = None,
     ):
         self.yaml_store = yaml_store
         self.topology_router = topology_router
@@ -107,6 +110,7 @@ class Orchestrator:
         self._tool_loader = tool_loader
         self._ring_enforcer = ring_enforcer
         self._self_reconfigurer = self_reconfigurer
+        self._evolution_engine = evolution_engine
 
         # Phase 3.5: Verify Ring 0 integrity at boot (if enforcer provided)
         if self._ring_enforcer is not None:
@@ -280,16 +284,22 @@ class Orchestrator:
                     topology_used=topology_used,
                     agent_tones=agent_tones if agent_tones else None,
                 )
-            except Exception as e:
-                logger.warning(
-                    f"Phase 2 metric recording failed for {task_id}: {e}",
+            except OSError as e:
+                logger.error(
+                    f"Phase 2 metric recording I/O failed for {task_id}: {e}",
                     exc_info=True,
                 )
-                # Non-fatal: metrics are valuable but not critical path
+                # I/O failures are retriable — allow task to complete.
+                # ValueError/TypeError/etc. propagate as programming bugs.
 
             # Dissolve team
             if task.team_id:
                 self.team_manager.dissolve_team(task.team_id, "Task complete")
+
+        # FM-P4-46: Notify evolution engine on ALL verdicts (pass, fail, partial).
+        # Evolution cooldown counts total completed tasks, not just successful ones.
+        if self._evolution_engine is not None:
+            self._evolution_engine.record_task_completion()
         return task
 
     def record_task_outcome(
@@ -421,8 +431,9 @@ class Orchestrator:
         path = f"{agents_base}/{agent_id}/status.yaml"
         try:
             return self.yaml_store.read(path, AgentRegistryEntry)
-        except (FileNotFoundError, ValueError):
+        except FileNotFoundError:
             return None
+        # ValueError = corrupt YAML — let it propagate as a bug
 
     def generate_decomposition_prompt(self, task: Task) -> str:
         """Generate a prompt for the orchestrator agent to decompose a task.
@@ -513,3 +524,46 @@ For each subtask, provide:
         if desc_len < 400:
             return "medium"
         return "large"
+
+    # ── Phase 4: Evolution integration ──
+
+    def trigger_evolution_if_ready(
+        self,
+        trigger: str,
+        trigger_detail: str,
+        component: str,
+        diff: str,
+        rationale: str,
+    ) -> EvolutionRecord | None:
+        """Check if evolution cooldown has elapsed and run if ready.
+
+        Called by the autonomous run loop (Phase 5) or manually.
+        Returns EvolutionRecord if evolution was run, None if cooldown active.
+
+        DR-10: Validates trigger is a valid ObservationTrigger value before
+        constructing the proposal. Invalid triggers raise ValueError.
+        """
+        if self._evolution_engine is None:
+            return None
+        if not self._evolution_engine.can_evolve():
+            return None
+
+        from ..models.evolution import EvolutionRecord, ObservationTrigger
+
+        # DR-10: Validate trigger value — fail loud on invalid trigger
+        try:
+            trigger_enum = ObservationTrigger(trigger)
+        except ValueError:
+            raise ValueError(
+                f"Invalid evolution trigger '{trigger}'. "
+                f"Valid triggers: {[t.value for t in ObservationTrigger]}"
+            )
+
+        proposal = self._evolution_engine.create_proposal(
+            component=component,
+            diff=diff,
+            rationale=rationale,
+            trigger=trigger_enum,
+            trigger_detail=trigger_detail,
+        )
+        return self._evolution_engine.run_evolution(proposal)

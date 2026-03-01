@@ -32,15 +32,28 @@ class BaseLogEntry(FrameworkModel):
 
 
 class EvolutionLogEntry(BaseLogEntry):
+    """Evolution audit log entry — enhanced for Phase 4 lifecycle.
+
+    DR-02-FIX: Backward-compatible with existing callers (SkillLibrary).
+    Old required fields now have defaults. New Phase 4 fields added.
+    """
+
     stream: Literal[LogStream.EVOLUTION] = LogStream.EVOLUTION
     tier: EvolutionTier
     component: str
     diff: str
     rationale: str
     evidence: dict
-    approved_by: str
-    constitutional_check: str
-    rollback_commit: str
+    # Original fields — KEEP with defaults for backward compatibility
+    # (used by SkillLibrary._log_ring_transition and other Phase 3.5 callers)
+    approved_by: str = ""
+    constitutional_check: str = ""
+    rollback_commit: str = ""
+    # Phase 4 additions (all have defaults — backward compatible):
+    lifecycle_state: str = ""  # EvolutionLifecycleState value
+    outcome: str = ""          # EvolutionOutcome value
+    evaluation_score: float = 0.0  # Overall evaluation score
+    trigger: str = ""          # ObservationTrigger value
 
 
 class TaskLogEntry(BaseLogEntry):
