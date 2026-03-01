@@ -75,6 +75,24 @@ class EnvironmentLogEntry(BaseLogEntry):
     detail: dict
 
 
+class DiversityLogEntry(BaseLogEntry):
+    stream: Literal[LogStream.DIVERSITY] = LogStream.DIVERSITY
+    task_id: str
+    srd_composite: float
+    text_diversity: float
+    vdi_score: float | None = None
+    agent_count: int
+    stagnation_signals: list[dict]
+    health_status: str
+
+
+class ConsumptionLogEntry(BaseLogEntry):
+    """FM-18: Typed consumption record for append-only ledger."""
+    stream: Literal[LogStream.RESOURCES] = LogStream.RESOURCES
+    tokens: int
+    is_cached: bool = False
+
+
 class TraceLogEntry(BaseLogEntry):
     stream: Literal[LogStream.TRACES] = LogStream.TRACES
     level: Literal["operational", "cognitive", "contextual"]

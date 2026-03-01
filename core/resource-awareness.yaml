@@ -1,0 +1,58 @@
+# Resource awareness configuration (Section 18)
+# This is the single source of truth for resource-related thresholds.
+# BudgetTracker loads cold seeds from this file on init.
+# Missing file = FileNotFoundError (fail-loud, no hardcoded fallback).
+resource_awareness:
+
+  claude_max_plan: "max5"  # max5 | max20
+
+  window:
+    duration_hours: 5
+    estimated_capacity_max5: 88000
+    estimated_capacity_max20: 220000
+
+  weekly:
+    estimated_cap: 1000000  # Conservative; adjusted empirically
+
+  budget_pressure:
+    green_threshold: 0.60   # > 60% remaining
+    yellow_threshold: 0.30  # 30-60%
+    orange_threshold: 0.10  # 10-30%
+    # Below 10% = RED
+
+  backpressure:
+    slow_spawning_at: 0.80   # 80% rate capacity
+    pause_noncritical_at: 0.90
+    single_agent_at: 0.95
+    full_stop_at: 1.00
+
+  cold_seeds:
+    # Task-type-based seeds (spec Section 18.2)
+    # These are conservative starting estimates replaced by rolling averages
+    # after rolling_average_threshold samples.
+    simple_fix: 2000
+    feature_small: 8000
+    feature_medium: 25000
+    feature_large: 80000
+    research: 15000
+    review: 5000
+    canary_suite: 3000        # Environment monitoring canary tests
+    skill_validation: 4000    # Skill crystallization validation
+    evolution_proposal: 6000  # Self-evolution proposal evaluation
+    decomposition: 5000       # Task decomposition by orchestrator
+
+  rolling_average_threshold: 10  # Samples before using rolling average
+  safety_margin_novel: 1.5       # 50% safety margin for novel tasks
+  budget_reserve_pct: 0.20       # 20% buffer for unexpected needs
+
+  idle_agent_timeout_minutes: 5
+
+  cost_caps:
+    daily: 10.0   # USD
+    weekly: 50.0   # USD
+
+  rate_limits:
+    # Initial estimates; updated from response headers
+    rpm_estimate: 50
+    itpm_estimate: 80000
+    otpm_estimate: 16000

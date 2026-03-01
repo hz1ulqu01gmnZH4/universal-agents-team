@@ -3,7 +3,7 @@ Spec reference: Section 19 (Environment Awareness & Self-Benchmarking)."""
 from __future__ import annotations
 
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..models.environment import CanaryResult, DriftDetection, ModelFingerprint
@@ -28,7 +28,7 @@ class EnvironmentMonitor:
         try:
             data = self.yaml_store.read_raw("core/last-fingerprint.yaml")
             last_run = datetime.fromisoformat(data.get("timestamp", ""))
-            elapsed = (datetime.utcnow() - last_run).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - last_run).total_seconds()
             if elapsed < 5 * 3600:  # 5 hours
                 stored_version = data.get("claude_version", "")
                 current_version = self.check_claude_version()
@@ -65,7 +65,7 @@ class EnvironmentMonitor:
         """Build fingerprint from canary results."""
         scores = {r.task_name: r.score for r in results}
         return ModelFingerprint(
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             model_id="claude-opus-4-6",
             reasoning_score=scores.get("reasoning", 0.0),
             instruction_score=scores.get("instruction", 0.0),

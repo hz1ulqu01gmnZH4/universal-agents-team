@@ -3,7 +3,7 @@ Spec reference: Part 4.9 (AuditTreeViewer)."""
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..audit.logger import AuditLogger
@@ -66,17 +66,17 @@ def main() -> None:
 def _parse_time(value: str) -> datetime:
     """Parse time specification: 'today', ISO datetime, or relative."""
     if value == "today":
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         return now.replace(hour=0, minute=0, second=0, microsecond=0)
     if value == "now":
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
 
     # Relative time: e.g. '1h', '30m', '2d'
     if value and value[-1] in ("h", "m", "d") and value[:-1].isdigit():
         amount = int(value[:-1])
         unit = value[-1]
         delta_map = {"h": "hours", "m": "minutes", "d": "days"}
-        return datetime.utcnow() - timedelta(**{delta_map[unit]: amount})
+        return datetime.now(timezone.utc) - timedelta(**{delta_map[unit]: amount})
 
     # ISO format
     return datetime.fromisoformat(value)

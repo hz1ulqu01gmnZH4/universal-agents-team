@@ -17,7 +17,8 @@ class DomainConfig(FrameworkModel):
     """Configuration for a domain instance."""
 
     name: str
-    charter_path: str
+    description: str = ""
+    charter_path: str = ""
     voice_defaults: VoiceDefaults = VoiceDefaults()
     active: bool = True
     max_concurrent_agents: int = 5

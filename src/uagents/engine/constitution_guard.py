@@ -3,11 +3,14 @@ Spec reference: Section 2 (Constitutional Axioms), Section 20 (Protection Rings)
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 from ..models.constitution import Constitution
 from ..models.evolution import EvolutionProposal
 from ..state.git_ops import GitOps
+
+logger = logging.getLogger("uagents.constitution_guard")
 
 
 class ConstitutionIntegrityError(RuntimeError):
@@ -43,8 +46,13 @@ class ConstitutionGuard:
         content = self.constitution_path.read_text(encoding="utf-8")
         actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-        # First run: store hash
+        # First run (TOFU): store hash and log the trust-on-first-use event
         if not self.hash_path.exists():
+            logger.warning(
+                f"TOFU: No constitution hash found at {self.hash_path}. "
+                f"Trusting first-seen hash: {actual_hash[:16]}... "
+                f"This is expected on first boot only."
+            )
             self.hash_path.write_text(actual_hash, encoding="utf-8")
             self._cached_hash = actual_hash
             return content
@@ -74,11 +82,12 @@ class ConstitutionGuard:
             return False
 
     def check_proposal(self, proposal: EvolutionProposal) -> tuple[bool, str]:
-        """Verify proposal does not target constitution-protected paths."""
-        # CONSTITUTION.md is never modifiable by evolution
-        if "CONSTITUTION.md" in proposal.component:
+        """Verify proposal does not target constitution-protected paths.
+        Case-insensitive to prevent bypasses via casing tricks."""
+        component_lower = proposal.component.lower()
+        if "constitution.md" in component_lower:
             return False, "Evolution cannot modify CONSTITUTION.md (Ring 0 immutable)"
-        if "constitution-hash" in proposal.component:
+        if "constitution-hash" in component_lower or "constitution_hash" in component_lower:
             return False, "Evolution cannot modify constitution hash"
         return True, "Constitutional check passed"
 

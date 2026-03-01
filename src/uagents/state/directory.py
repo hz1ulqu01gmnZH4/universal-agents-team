@@ -38,6 +38,7 @@ class DirectoryManager:
         "state/tasks/parked/",
         "state/tasks/completed/",
         "state/agents/",
+        "state/teams/",
         "state/evolution/",
         "state/evolution/proposals/",
         "state/evolution/candidates/",
@@ -61,6 +62,31 @@ class DirectoryManager:
         "core/audit.yaml": "",             # Audit configuration
     }
 
+    # Minimal role composition files for standard roles
+    STANDARD_ROLES: ClassVar[dict[str, str]] = {
+        "roles/compositions/orchestrator.yaml": (
+            "name: orchestrator\n"
+            "description: Strategic coordination and task decomposition\n"
+            "capabilities: []\n"
+            "model: opus\n"
+            "thinking: extended\n"
+        ),
+        "roles/compositions/implementer.yaml": (
+            "name: implementer\n"
+            "description: Code implementation and execution\n"
+            "capabilities: []\n"
+            "model: sonnet\n"
+            "thinking: normal\n"
+        ),
+        "roles/compositions/reviewer.yaml": (
+            "name: reviewer\n"
+            "description: Code review and quality assurance\n"
+            "capabilities: []\n"
+            "model: sonnet\n"
+            "thinking: normal\n"
+        ),
+    }
+
     def scaffold(self, root: Path, domain: str = "meta") -> list[str]:
         """Create full directory structure. Returns list of created items."""
         created: list[str] = []
@@ -80,6 +106,14 @@ class DirectoryManager:
                 path.write_text(content, encoding="utf-8")
                 created.append(filename)
 
+        # Standard role compositions (never overwrite existing)
+        for filename, content in self.STANDARD_ROLES.items():
+            path = root / filename
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                created.append(filename)
+
         # Domain instance
         created.extend(self.scaffold_domain(root, domain))
 
@@ -87,6 +121,11 @@ class DirectoryManager:
 
     def scaffold_domain(self, root: Path, domain_name: str) -> list[str]:
         """Create a new domain instance directory."""
+        # Validate domain_name to prevent path traversal
+        if not domain_name or "/" in domain_name or "\\" in domain_name or ".." in domain_name:
+            raise ValueError(
+                f"Invalid domain name '{domain_name}': must not contain path separators or '..'"
+            )
         created: list[str] = []
         instance_root = root / "instances" / domain_name
 

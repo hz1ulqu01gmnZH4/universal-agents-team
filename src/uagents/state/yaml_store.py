@@ -38,7 +38,7 @@ class YamlStore:
     def _resolve(self, relative_path: str) -> Path:
         """Resolve relative path to absolute, validate it stays within base_dir."""
         full = (self.base_dir / relative_path).resolve()
-        if not str(full).startswith(str(self.base_dir)):
+        if not full.is_relative_to(self.base_dir):
             raise ValueError(f"Path escapes base directory: {relative_path}")
         return full
 
@@ -61,35 +61,43 @@ class YamlStore:
             raise ValueError(f"Empty YAML file: {path}")
         return model_class.model_validate(data, strict=False)
 
-    def write(self, relative_path: str, model: FrameworkModel) -> None:
-        """Atomic write: serialize to temp file, then os.replace().
-        Acquires advisory lock for duration of write."""
-        path = self._resolve(relative_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Check disk space before write (S3)
+    def _check_disk_space(self, path: Path) -> None:
+        """Check disk space before write. Uses psutil if available, os.statvfs otherwise."""
+        threshold = 100 * 1024 * 1024  # 100MB
         try:
             import psutil
             disk = psutil.disk_usage(str(path.parent))
-            if disk.free < 100 * 1024 * 1024:  # 100MB threshold
-                raise OSError(
-                    f"Insufficient disk space ({disk.free // 1024 // 1024}MB free). "
-                    f"Refusing write to prevent data corruption: {path}"
-                )
+            free = disk.free
         except ImportError:
-            pass  # psutil optional for disk check
+            stat = os.statvfs(str(path.parent))
+            free = stat.f_bavail * stat.f_frsize
+        if free < threshold:
+            raise OSError(
+                f"Insufficient disk space ({free // 1024 // 1024}MB free). "
+                f"Refusing write to prevent data corruption: {path}"
+            )
+
+    def write(self, relative_path: str, model: FrameworkModel) -> None:
+        """Atomic write: serialize to temp file, then os.replace().
+        Acquires advisory lock on sidecar .lock file for mutual exclusion."""
+        path = self._resolve(relative_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._check_disk_space(path)
 
         data = model.model_dump(mode="json", exclude_none=True)
         tmp_path = path.with_suffix(f".tmp.{os.getpid()}")
+        lock_path = path.with_suffix(path.suffix + ".lock")
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                yaml.dump(data, f, default_flow_style=False,
-                          allow_unicode=True, sort_keys=False)
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            tmp_path.replace(path)  # Atomic on POSIX
+            with open(lock_path, "w", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, default_flow_style=False,
+                              allow_unicode=True, sort_keys=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp_path.replace(path)  # Atomic on POSIX
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         except Exception:
-            # Clean up temp file on any failure
             if tmp_path.exists():
                 tmp_path.unlink()
             raise
@@ -99,6 +107,11 @@ class YamlStore:
         path = self._resolve(relative_path)
         if not path.exists():
             raise FileNotFoundError(f"Required YAML file not found: {path}")
+        file_size = path.stat().st_size
+        if file_size > MAX_YAML_SIZE_BYTES:
+            raise ValueError(
+                f"YAML file exceeds size cap ({file_size} > {MAX_YAML_SIZE_BYTES}): {path}"
+            )
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if data is None:
@@ -108,19 +121,52 @@ class YamlStore:
         return data
 
     def write_raw(self, relative_path: str, data: dict) -> None:
-        """Atomic write from raw dict. Same atomic pattern as write()."""
+        """Atomic write from raw dict. Same atomic+locked pattern as write()."""
         path = self._resolve(relative_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._check_disk_space(path)
         tmp_path = path.with_suffix(f".tmp.{os.getpid()}")
+        lock_path = path.with_suffix(path.suffix + ".lock")
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                yaml.dump(data, f, default_flow_style=False,
-                          allow_unicode=True, sort_keys=False)
-            tmp_path.replace(path)
+            with open(lock_path, "w", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, default_flow_style=False,
+                              allow_unicode=True, sort_keys=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp_path.replace(path)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         except Exception:
             if tmp_path.exists():
                 tmp_path.unlink()
             raise
+
+    def delete(self, relative_path: str) -> None:
+        """Delete a YAML file. FM-101: Required by cost record archival.
+
+        Acquires advisory lock before deletion to prevent concurrent
+        read-delete races. Raises FileNotFoundError if file does not exist.
+        """
+        path = self._resolve(relative_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Cannot delete non-existent file: {path}")
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with open(lock_path, "w", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            path.unlink()
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        # Clean up lock file (best-effort)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def ensure_dir(self, relative_path: str) -> Path:
+        """Create directory (and parents) if it doesn't exist. Returns the absolute path."""
+        path = self._resolve(relative_path)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def exists(self, relative_path: str) -> bool:
         return self._resolve(relative_path).exists()

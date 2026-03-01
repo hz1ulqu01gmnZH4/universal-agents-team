@@ -11,6 +11,7 @@ from pydantic import Field
 from .base import FrameworkModel, IdentifiableModel, TimestampedModel
 from .capability import ModelPreference
 from .constitution import TaskMandate
+from .resource import TaskBudgetAnnotation
 
 
 class TaskStatus(StrEnum):
@@ -114,6 +115,9 @@ class Task(IdentifiableModel):
     review: TaskReview | None = None
     artifacts: dict = {}
     metrics: TaskMetrics = TaskMetrics()
+    budget: TaskBudgetAnnotation | None = None  # Phase 1.5: budget annotation
+    team_id: str | None = None  # Team managing this task
+    subtasks: list[str] = []  # SubTask IDs for decomposed work
 
 
 # Valid state transitions — enforced by TaskLifecycle engine
@@ -123,7 +127,7 @@ VALID_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.PLANNING: {TaskStatus.EXECUTING, TaskStatus.PARKED},
     TaskStatus.EXECUTING: {TaskStatus.REVIEWING, TaskStatus.PARKED},
     TaskStatus.PARKED: {TaskStatus.PLANNING, TaskStatus.EXECUTING},
-    TaskStatus.REVIEWING: {TaskStatus.VERDICT},
+    TaskStatus.REVIEWING: {TaskStatus.VERDICT, TaskStatus.PARKED},
     TaskStatus.VERDICT: {TaskStatus.COMPLETE, TaskStatus.PLANNING},  # fail → re-plan
     TaskStatus.COMPLETE: {TaskStatus.ARCHIVED},
     TaskStatus.ARCHIVED: set(),  # terminal state

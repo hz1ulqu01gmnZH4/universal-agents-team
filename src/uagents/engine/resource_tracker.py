@@ -1,12 +1,18 @@
 """4-layer resource awareness stack.
-Spec reference: Section 18 (Resource Awareness & Self-Budgeting)."""
+Spec reference: Section 18 (Resource Awareness & Self-Budgeting).
+
+Phase 1.5: BudgetTracker and RateLimiter delegate estimation, backpressure,
+and usage recording. COLD_SEEDS removed (FM-14/FM-22/FM-24).
+"""
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..models.resource import (
     BudgetPressureLevel,
@@ -19,31 +25,35 @@ from ..models.resource import (
 )
 from ..state.yaml_store import YamlStore
 
+if TYPE_CHECKING:
+    from .budget_tracker import BudgetTracker
+    from .rate_limiter import RateLimiter
 
-# Cold-start seeds for token estimation (Section 18.2)
-COLD_SEEDS: dict[str, int] = {
-    "simple_fix": 2_000,
-    "feature_small": 8_000,
-    "feature_medium": 25_000,
-    "feature_large": 80_000,
-    "research": 15_000,
-    "review": 5_000,
-}
+logger = logging.getLogger("uagents.resource_tracker")
 
 
 class ResourceTracker:
     """4-layer resource awareness: compute, rate limits, token budget, cost decisions.
 
+    Phase 1.5: Delegates to BudgetTracker (layer 3) and RateLimiter (layer 2)
+    when available. Falls back to Phase 0 behavior when they are None.
+
     Token estimation strategy:
-    - Primary: parse /usage output from a secondary Claude Code shell (I8)
-    - Fallback: character-ratio estimation (3.5 chars/token English)
-    - Rolling average replaces cold seeds after 10 samples (P4)
+    - Primary (Phase 1.5): BudgetTracker with YAML-loaded cold seeds + rolling average
+    - Fallback (Phase 0): parse /usage output or character-ratio estimation
     """
 
-    def __init__(self, yaml_store: YamlStore, state_dir: Path):
+    def __init__(
+        self,
+        yaml_store: YamlStore,
+        state_dir: Path,
+        budget_tracker: BudgetTracker | None = None,
+        rate_limiter: RateLimiter | None = None,
+    ):
         self.yaml_store = yaml_store
         self.state_dir = state_dir
-        self._token_history: deque[tuple[str, int]] = deque(maxlen=100)
+        self._budget_tracker = budget_tracker
+        self._rate_limiter = rate_limiter
         self._chars_per_token: float = 3.5  # Calibrated over time
 
     # ── Layer 1: Compute ──
@@ -81,26 +91,40 @@ class ResourceTracker:
         pass  # Full implementation in Phase 1
 
     def get_backpressure_level(self) -> float:
-        """0.0 = no pressure, 1.0 = at limit."""
+        """0.0 = no pressure, 1.0 = at limit.
+        Phase 1.5: delegates to RateLimiter when available.
+        """
+        if self._rate_limiter is not None:
+            return self._rate_limiter.get_backpressure()
         return 0.0  # Phase 0: no rate tracking
 
     # ── Layer 3: Token Budget ──
 
     def estimate_task_cost(self, task_type: str, complexity: str = "medium") -> int:
         """Estimate token cost for a task type.
-        Uses rolling average if available, cold seeds otherwise."""
+        Phase 1.5 (FM-14/FM-22/FM-24): delegates to BudgetTracker.
+        Phase 0 fallback: hardcoded seeds + in-memory history.
+        """
+        if self._budget_tracker is not None:
+            return self._budget_tracker.estimate_task_cost(task_type, complexity)
+        # Phase 0 fallback: hardcoded seeds
+        _PHASE0_SEEDS: dict[str, int] = {
+            "simple_fix": 2_000, "feature_small": 8_000,
+            "feature_medium": 25_000, "feature_large": 80_000,
+            "research": 15_000, "review": 5_000,
+        }
         key = f"{task_type}_{complexity}" if complexity else task_type
-        # Check history for this task type
-        matching = [t for label, t in self._token_history if label == key]
-        if len(matching) >= 3:
-            return int(sum(matching) / len(matching))
-        # Fall back to cold seeds
-        return COLD_SEEDS.get(key, COLD_SEEDS.get(task_type, 10_000))
+        return _PHASE0_SEEDS.get(key, _PHASE0_SEEDS.get(task_type, 10_000))
 
-    def record_actual_usage(self, task_type: str, tokens_used: int) -> None:
-        """Record actual token usage for calibration."""
-        self._token_history.append((task_type, tokens_used))
-        # Recalibrate chars_per_token if we have /usage data
+    def record_actual_usage(self, task_type: str, tokens_used: int, complexity: str = "medium") -> None:
+        """Record actual token usage for calibration.
+        FM-15: Signature adapter — Phase 0 was (task_type, tokens_used),
+        Phase 1.5 BudgetTracker wants (task_type, complexity, tokens_used).
+        """
+        if self._budget_tracker is not None:
+            self._budget_tracker.record_actual_usage(task_type, complexity, tokens_used)
+            return
+        # Phase 0 fallback: no-op (was recalibrating against /usage data)
         self._maybe_recalibrate()
 
     def parse_usage_output(self) -> dict | None:
@@ -152,11 +176,21 @@ class ResourceTracker:
     # ── Internal ──
 
     def _count_active_agents(self) -> int:
-        """Count active agents from registry files."""
+        """Count agents with status == 'active' (not despawned/errored)."""
         agents_dir = self.state_dir / "agents"
         if not agents_dir.exists():
             return 0
-        return sum(1 for _ in agents_dir.glob("*/status.yaml"))
+        count = 0
+        for status_file in agents_dir.glob("*/status.yaml"):
+            try:
+                with open(status_file, encoding="utf-8") as f:
+                    import yaml
+                    data = yaml.safe_load(f)
+                if data and data.get("status") == "active":
+                    count += 1
+            except Exception:
+                continue
+        return count
 
     def _maybe_recalibrate(self) -> None:
         """Recalibrate chars_per_token ratio against /usage data (P4)."""

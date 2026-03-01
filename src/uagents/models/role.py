@@ -15,9 +15,9 @@ from .voice import VoiceProfile
 class BehavioralDescriptors(FrameworkModel):
     """Behavioral traits that shape reasoning style."""
 
-    reasoning_style: Literal["strategic", "divergent", "analytical", "convergent", "lateral"]
-    risk_tolerance: Literal["very_low", "low", "moderate", "high", "very_high"]
-    exploration_vs_exploitation: float = Field(ge=0.0, le=1.0)
+    reasoning_style: Literal["strategic", "divergent", "analytical", "convergent", "lateral"] = "analytical"
+    risk_tolerance: Literal["very_low", "low", "moderate", "high", "very_high"] = "moderate"
+    exploration_vs_exploitation: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class AuthorityLevel(IntEnum):
@@ -31,16 +31,19 @@ class AuthorityLevel(IntEnum):
 
 class RoleComposition(FrameworkModel):
     """A complete role definition composed from atoms.
-    Loaded from roles/compositions/{name}.yaml."""
+    Loaded from roles/compositions/{name}.yaml.
+
+    Phase 1: accepts simplified construction for testing and lightweight usage.
+    Full construction with all fields remains supported."""
 
     name: str
     description: str
     capabilities: list[str]  # References to CapabilityAtom names in capabilities.yaml
-    model: ModelPreference
-    thinking: ThinkingSetting
-    behavioral_descriptors: BehavioralDescriptors
-    voice: VoiceProfile
-    authority_level: AuthorityLevel
+    model: ModelPreference | str = ModelPreference.SONNET
+    thinking: ThinkingSetting | str = "normal"
+    behavioral_descriptors: BehavioralDescriptors = BehavioralDescriptors()
+    voice: VoiceProfile | None = None  # None uses domain defaults
+    authority_level: AuthorityLevel = AuthorityLevel.WORKER
     forbidden: list[str] = []
     scout_config: dict | None = None  # For scout roles: exploration parameters
     review_mandate: dict | None = None  # For reviewer roles: required checks

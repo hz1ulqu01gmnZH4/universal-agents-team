@@ -1,10 +1,14 @@
 """Ring-ordered prompt assembly engine.
 Spec reference: Section 21 (Context Engineering Pipeline),
-Section 4.6 (Voice System), Section 20.5 (Compression Cascade)."""
+Section 4.6 (Voice System), Section 20.5 (Compression Cascade).
+
+Phase 1.5: Budget injection (FM-21) and cache-aware prefix (FM-20).
+"""
 from __future__ import annotations
 
 from enum import IntEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..models.base import FrameworkModel
 from ..models.capability import CapabilityAtom
@@ -21,6 +25,9 @@ from ..models.role import RoleComposition
 from ..models.task import Task
 from ..models.voice import VoiceAtom, VoiceProfile
 from ..state.yaml_store import YamlStore
+
+if TYPE_CHECKING:
+    from .cache_manager import CacheManager
 
 
 class PromptRing(IntEnum):
@@ -41,6 +48,7 @@ class PromptSection(FrameworkModel):
     token_estimate: int
     compressible: bool  # Ring 0 sections = False, all others = True
     priority: float     # 0.0 = drop first, 1.0 = drop last (within ring)
+    is_cached: bool = False  # Phase 1.5: marks section as part of cached prefix
 
 
 class ComposedPrompt(FrameworkModel):
@@ -97,18 +105,39 @@ class PromptComposer:
         voice_atoms: dict[str, VoiceAtom],
         max_tokens: int = 200_000,
         allocation: ContextBudgetAllocation | None = None,
+        budget_summary: dict | None = None,
+        cache_manager: CacheManager | None = None,
     ) -> ComposedPrompt:
-        """Full prompt composition pipeline."""
+        """Full prompt composition pipeline.
+
+        Phase 1.5 additions:
+        - budget_summary: injected into Ring 1 via _build_ring_1_resource_awareness()
+        - cache_manager: marks Ring 0/1 sections as cached for token accounting
+        """
         if allocation is None:
             allocation = ContextBudgetAllocation()
 
         # 1. Build all ring sections
         sections: list[PromptSection] = []
-        sections.extend(self._build_ring_0())
-        sections.extend(self._build_ring_1(domain))
+        ring_0_sections = self._build_ring_0()
+        sections.extend(ring_0_sections)
+        ring_1_sections = self._build_ring_1(domain)
+        # FM-21: Inject budget summary into Ring 1
+        if budget_summary is not None:
+            ring_1_sections.append(self._build_ring_1_resource_awareness(budget_summary))
+        sections.extend(ring_1_sections)
         sections.extend(self._build_ring_2(role, capabilities, voice_atoms,
                                             domain.voice_defaults))
         sections.extend(self._build_ring_3(task))
+
+        # FM-20: Cache-aware prefix marking
+        if cache_manager is not None:
+            ring_0_content = "\n".join(s.content for s in ring_0_sections)
+            ring_1_content = "\n".join(s.content for s in ring_1_sections)
+            cache_manager.get_shared_prefix(ring_0_content, ring_1_content)
+            for section in sections:
+                if section.ring in (PromptRing.RING_0, PromptRing.RING_1):
+                    section.is_cached = True
 
         # 2. Calculate totals
         total = sum(s.token_estimate for s in sections)
@@ -127,11 +156,20 @@ class PromptComposer:
 
         final_total = sum(s.token_estimate for s in sections)
 
+        # Resolve voice profile: role.voice > domain defaults
+        voice_profile = role.voice
+        if voice_profile is None:
+            voice_profile = VoiceProfile(
+                language=domain.voice_defaults.language,
+                tone=domain.voice_defaults.tone,
+                style=domain.voice_defaults.style,
+            )
+
         return ComposedPrompt(
             sections=sections,
             total_tokens=final_total,
             compression_stage=stage,
-            voice_profile=role.voice,
+            voice_profile=voice_profile,
             tools_loaded=[],  # Populated by tool loader
             dropped_sections=dropped,
         )
@@ -168,6 +206,37 @@ class PromptComposer:
             )
         ]
 
+    def _build_ring_1_resource_awareness(self, budget_summary: dict) -> PromptSection:
+        """Inject resource awareness into Ring 1 (FM-21).
+
+        BATS-style continuous budget visibility for executing agents.
+        """
+        content = (
+            "## Resource Budget\n"
+            f"Window: {budget_summary['window_remaining_tokens']:,} tokens remaining "
+            f"({budget_summary['window_utilization_pct']}% used)\n"
+            f"Pressure: {budget_summary['window_pressure']}\n"
+            f"Weekly: {budget_summary['weekly_remaining_tokens']:,} tokens remaining "
+            f"({budget_summary['weekly_utilization_pct']}% used)\n"
+        )
+
+        pressure = budget_summary["window_pressure"]
+        if pressure == "yellow":
+            content += "\nBUDGET GUIDANCE: Compress context, reduce tool calls, prefer cheaper operations.\n"
+        elif pressure == "orange":
+            content += "\nBUDGET WARNING: Critical-only tasks. Aggressive compression. Single-agent mode.\n"
+        elif pressure == "red":
+            content += "\nBUDGET EMERGENCY: Complete active task only. Park everything else. Alert human.\n"
+
+        return PromptSection(
+            ring=PromptRing.RING_1,
+            name="resource_awareness",
+            content=content,
+            token_estimate=estimate_tokens(content),
+            compressible=True,
+            priority=0.9,
+        )
+
     def _build_ring_2(
         self,
         role: RoleComposition,
@@ -200,8 +269,16 @@ class PromptComposer:
         ))
 
         # Voice block (with compression awareness)
+        # Resolve voice: role.voice > domain defaults
+        effective_voice = role.voice
+        if effective_voice is None:
+            effective_voice = VoiceProfile(
+                language=domain_voice.language if domain_voice else "language_japanese",
+                tone=domain_voice.tone if domain_voice else None,
+                style=domain_voice.style if domain_voice else None,
+            )
         voice_content = self._compose_voice_block(
-            role.voice, voice_atoms, CompressionStage.NONE
+            effective_voice, voice_atoms, CompressionStage.NONE
         )
         sections.append(PromptSection(
             ring=PromptRing.RING_2,

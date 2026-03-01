@@ -15,3 +15,4 @@ class SessionLock(FrameworkModel):
     session_id: str
     claude_version: str
     active_domain: str
+    pid_start_time: float | None = None  # Process start time for PID reuse detection

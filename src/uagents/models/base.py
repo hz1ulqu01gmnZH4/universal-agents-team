@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
@@ -43,10 +44,11 @@ _id_counters: dict[str, int] = {}
 
 
 def generate_id(prefix: str) -> str:
-    """Generate a timestamped unique ID.
+    """Generate a globally unique timestamped ID.
 
-    Format: {prefix}-{YYYYMMDD}-{NNN} where NNN is a zero-padded counter.
-    Counter is per-prefix, per-process, monotonically increasing.
+    Format: {prefix}-{YYYYMMDD}-{NNN}-{hex8}
+    - NNN is a zero-padded per-process counter (monotonically increasing)
+    - hex8 is 8 chars of uuid4 for cross-process uniqueness
     Thread-safe via lock.
     """
     date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -54,7 +56,8 @@ def generate_id(prefix: str) -> str:
     with _id_lock:
         _id_counters[key] = _id_counters.get(key, 0) + 1
         counter = _id_counters[key]
-    return f"{prefix}-{date_str}-{counter:03d}"
+    suffix = uuid.uuid4().hex[:8]
+    return f"{prefix}-{date_str}-{counter:03d}-{suffix}"
 
 
 def validate_yaml_path(path: Path) -> Path:

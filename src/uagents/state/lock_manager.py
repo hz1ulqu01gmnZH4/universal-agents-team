@@ -6,7 +6,7 @@ import atexit
 import os
 import signal
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -35,17 +35,40 @@ class LockManager:
         self.lock_path = framework_root / LOCK_FILENAME
         self._owns_lock = False
 
+    @staticmethod
+    def _get_process_start_time(pid: int) -> float | None:
+        """Get process start time for PID reuse detection."""
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            return proc.create_time()
+        except Exception:
+            return None
+
     def acquire(self, domain: str = "meta") -> SessionLock:
         """Acquire lock. Raises SessionAlreadyActiveError if lock held
         by live process. Removes stale locks with warning."""
         if self.lock_path.exists():
             existing = self._read_lock()
             if existing and self._is_process_alive(existing.pid):
-                raise SessionAlreadyActiveError(
-                    f"Another framework session is active "
-                    f"(PID {existing.pid}, started {existing.started}). "
-                    f"Terminate it first or run 'tools/force-unlock.sh'."
-                )
+                # Additional PID reuse check via start_time
+                current_start = self._get_process_start_time(existing.pid)
+                if (existing.pid_start_time is not None
+                        and current_start is not None
+                        and abs(current_start - existing.pid_start_time) > 1.0):
+                    # PID was reused — this is a stale lock
+                    import sys
+                    print(
+                        f"WARNING: Removing stale lock (PID {existing.pid} was reused)",
+                        file=sys.stderr,
+                    )
+                    self.lock_path.unlink()
+                else:
+                    raise SessionAlreadyActiveError(
+                        f"Another framework session is active "
+                        f"(PID {existing.pid}, started {existing.started}). "
+                        f"Terminate it first or run 'tools/force-unlock.sh'."
+                    )
             else:
                 # Stale lock — warn and remove (L1)
                 import sys
@@ -58,10 +81,11 @@ class LockManager:
 
         lock = SessionLock(
             pid=os.getpid(),
-            started=datetime.utcnow(),
-            session_id=f"sess-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}",
+            started=datetime.now(timezone.utc),
+            session_id=f"sess-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
             claude_version=self._get_claude_version(),
             active_domain=domain,
+            pid_start_time=self._get_process_start_time(os.getpid()),
         )
 
         # Atomic create via exclusive open (L4)

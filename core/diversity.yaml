@@ -1,0 +1,43 @@
+# Diversity measurement configuration
+# Spec reference: Section 10 (Diversity Enforcement)
+
+diversity:
+  srd:
+    floor: 0.3          # Below: ALERT — diversity collapse (Axiom A6)
+    warning: 0.4         # Below: approaching collapse
+    healthy_low: 0.5
+    healthy_high: 0.7
+    ceiling: 0.9          # Above: possible incoherence
+    text_weight: 0.8      # Weight of text diversity in composite SRD
+    vdi_weight: 0.2       # Weight of VDI in composite SRD
+
+  vdi:
+    floor: 0.2            # Below for 3 tasks: voice stagnation
+    dimension_weights:
+      language: 0.15
+      tone: 0.20
+      style: 0.15
+      persona: 0.15
+      formality: 0.175
+      verbosity: 0.175
+
+  stagnation:
+    agent_similarity_threshold: 0.9     # Cosine > this = too similar
+    agent_consecutive_threshold: 3      # 3 consecutive similar outputs
+    voice_same_tone_threshold: 5        # 5+ tasks with same tone
+    vdi_consecutive_threshold: 3        # VDI below floor for 3 tasks
+    srd_consecutive_threshold: 3        # SRD below warning for 3 tasks
+    framework_evolution_threshold: 10   # No Tier 2+ evo in 10 tasks
+    framework_topology_threshold: 10    # Same topology for 10 tasks
+    history_size: 100                   # Max values retained in history
+
+  interventions:
+    below_floor:
+      - "ALERT human supervisor"
+      - "Spawn scout agent with divergent role composition"
+      - "Inject novelty: randomly perturb agent behavioral descriptors"
+      - "Inject novelty: randomly assign alternate voice profile"
+      - "Force role switch: convert most-conforming agent to scout"
+    above_ceiling:
+      - "Increase structured debate rounds"
+      - "Assign integration task to orchestrator"

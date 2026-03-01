@@ -1,0 +1,35 @@
+# Self-capability assessment configuration
+# Spec reference: Section 13 (Self-Capability Awareness)
+
+self_assessment:
+  capability_map:
+    update_frequency: "after_every_task"
+    output_path: "state/self-assessment/capability-map.yaml"
+    weak_area_threshold: 0.5       # Success rate below this = weak area
+    min_attempts_for_analysis: 3   # Need at least 3 attempts before judging
+
+  calibration:
+    ece_alert_threshold: 0.15      # Rolling ECE above this triggers response
+    ece_window_size: 10            # Rolling window for ECE computation
+    gap_minimum: 0.05              # Min gap for reliable self-improvement
+    confidence_deflation_rate: 0.05
+    overcalibration_streak_limit: 5
+    false_positive_threshold: 0.10  # > 10% FP → tighten criteria
+    false_negative_threshold: 0.30  # > 30% FN → loosen criteria
+    initial_evidence_threshold: 0.6
+
+  known_task_types:
+    - canary_suite
+    - evolution_proposal
+    - decomposition
+    - skill_validation
+    - review
+    - simple_fix
+    - research
+    - feature
+
+  complexity_thresholds:
+    # FM-41: Learned classifier token thresholds
+    small_max_tokens: 5000
+    medium_max_tokens: 20000
+    min_samples_for_learned: 10

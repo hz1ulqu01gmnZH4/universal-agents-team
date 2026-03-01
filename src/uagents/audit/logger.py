@@ -8,6 +8,7 @@ from pathlib import Path
 from ..models.audit import (
     BaseLogEntry,
     DecisionLogEntry,
+    DiversityLogEntry,
     EnvironmentLogEntry,
     EvolutionLogEntry,
     LogStream,
@@ -48,6 +49,9 @@ class AuditLogger:
 
     def log_environment(self, entry: EnvironmentLogEntry) -> None:
         self.writers[LogStream.ENVIRONMENT].append(entry)
+
+    def log_diversity(self, entry: DiversityLogEntry) -> None:
+        self.writers[LogStream.DIVERSITY].append(entry)
 
     def log_trace(self, entry: TraceLogEntry) -> None:
         self.writers[LogStream.TRACES].append(entry)
