@@ -42,6 +42,7 @@ class SkillStatus(StrEnum):
     ACTIVE = "active"                  # In the skill library, available for use
     DEPRECATED = "deprecated"          # Pruned due to low performance or staleness
     REJECTED = "rejected"              # Failed validation at any stage
+    QUARANTINED = "quarantined"        # MF-4: Security scan flagged, pending review
 
 
 class ValidationStage(StrEnum):
@@ -289,6 +290,7 @@ class SkillMaintenanceAction(StrEnum):
     MERGE = "merge"        # Consolidate near-duplicate skills
     PROMOTE = "promote"    # Ring 3 -> Ring 2
     DEMOTE = "demote"      # Ring 2 -> Ring 3
+    QUARANTINE = "quarantine"  # MF-4: Security scan quarantine
 
 
 class MaintenanceRecord(IdentifiableModel):

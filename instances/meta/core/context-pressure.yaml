@@ -1,0 +1,63 @@
+# Context pressure management configuration
+# Spec reference: Section 20.5 (Context Pressure Management)
+# Spec reference: Section 21.2 (Context Budget Allocation)
+
+context_pressure:
+
+  # --- Context window thresholds ---
+  # Determines ContextPressureLevel from utilization fraction
+  # IFM-N68: No healthy_threshold — HEALTHY is implicitly "below pressure"
+  thresholds:
+    pressure: 0.60     # 60-80% -> trigger compression
+    critical: 0.80     # 80-95% -> aggressive compression + tool reduction
+    overflow: 0.95     # > 95% -> emergency: summarize everything, single tool
+
+  # --- Ring 0 reservation ---
+  # Minimum context space NEVER compressed (constitution + safety + self-monitor)
+  ring_0:
+    reserved_tokens: 2000
+    min_productive_tokens: 1000  # Below this after Ring 0: HARD_FAIL
+    enforcement: "hard_fail"     # Options: hard_fail, warn_only
+
+  # --- Compression cascade ---
+  # Progressive compression stages as context pressure increases
+  # Invariant: Ring 0 content is NEVER compressed or summarized
+  compression_cascade:
+    stage_1_history:
+      trigger: 0.60
+      action: "Summarize oldest conversation turns, keep last 3 detailed"
+      history_keep_recent: 3
+    stage_2_tool_reduction:
+      trigger: 0.70
+      action: "Reduce loaded tools to top-3 most relevant (Ring 0-1 exempt)"
+      tool_reduction_target: 3
+    stage_3_task_pruning:
+      trigger: 0.80
+      action: "SWE-Pruner-style task-aware context pruning (23-54% reduction)"
+    stage_4_system_compress:
+      trigger: 0.90
+      action: "Reduce system prompt to Ring 0 instructions only"
+    stage_5_emergency:
+      trigger: 0.95
+      action: "Summarize all non-Ring-0 context. HARD_FAIL if still insufficient."
+
+  # --- Information placement ---
+  # Mitigate lost-in-the-middle effect (>30% accuracy drop, Liu 2023)
+  placement:
+    enabled: true
+    rules:
+      - position: "beginning"
+        content: "System instructions, current task goal, safety constraints"
+      - position: "end"
+        content: "Latest results, next action, tool definitions"
+      - position: "middle"
+        content: "Historical context, reference material (least critical)"
+
+  # --- Context budget allocation ---
+  # Pre-allocate context window space by category (Section 21.2)
+  budget_allocation:
+    system_instructions_pct: 0.10  # Ring 0 constitution + role + mandate
+    active_tools_pct: 0.15         # Currently loaded tool definitions (3-5 tools)
+    current_task_pct: 0.40         # Task description, plan, current step
+    working_memory_pct: 0.25       # Conversation history, intermediate results
+    reserve_pct: 0.10              # Buffer for unexpected needs

@@ -31,6 +31,7 @@ from ..engine.diversity_engine import (
     tokenize,
 )
 from ..models.audit import EvolutionLogEntry
+from ..models.reconfiguration import SecurityScanResult
 from ..models.base import generate_id
 from ..models.evolution import EvolutionTier
 from ..models.protection import ProtectionRing, RingTransition
@@ -423,6 +424,30 @@ class SkillLibrary:
         demote_records = self._demote_underperforming(all_skills)
         records.extend(demote_records)
 
+        # ---- Phase 3.5 insertion point (IFM-N63) ----
+        # Step 6 (Phase 3.5): Security scan of Ring 3 skills
+        # Placed AFTER demote (Step 5) and BEFORE the persist/trim loop.
+        scan_result = self.run_security_scan()
+        quarantine_records: list[MaintenanceRecord] = []
+        if scan_result.quarantined_skills:
+            for quarantined_name in scan_result.quarantined_skills:
+                record = MaintenanceRecord(
+                    id=generate_id("maint"),
+                    created_at=datetime.now(timezone.utc),
+                    action=SkillMaintenanceAction.QUARANTINE,  # MF-4
+                    skill_name=quarantined_name,
+                    detail=(
+                        f"Security scan quarantine: "
+                        f"{scan_result.vulnerabilities_found} vulnerabilities"
+                    ),
+                    composite_score=0.0,
+                    success_rate=0.0,
+                    usage_count=0,
+                )
+                quarantine_records.append(record)
+            records.extend(quarantine_records)
+        # ---- End Phase 3.5 insertion ----
+
         # Persist maintenance records
         for rec in records:
             self._persist_maintenance_record(rec)
@@ -436,7 +461,8 @@ class SkillLibrary:
         logger.info(
             f"Maintenance complete: {len(records)} actions taken "
             f"({len(prune_records)} pruned, {len(merge_records)} merged, "
-            f"{len(promote_records)} promoted, {len(demote_records)} demoted)"
+            f"{len(promote_records)} promoted, {len(demote_records)} demoted, "
+            f"{len(scan_result.quarantined_skills)} quarantined)"
         )
 
         return records
@@ -642,6 +668,24 @@ class SkillLibrary:
                 )
 
             if reason:
+                # Phase 3.5: Last-in-category protection
+                # Protect the last skill covering a task type, but only when
+                # multiple categories exist. When all skills share the same
+                # category, protection is meaningless (no cross-category
+                # coverage to preserve).
+                distinct_categories = {
+                    s.source.task_type for s in skills if s.is_active
+                }
+                if (
+                    len(distinct_categories) > 1
+                    and self._is_last_in_category(skill, skills)
+                ):
+                    logger.info(
+                        f"Skipping prune of '{skill.name}': last in category "
+                        f"(domain={skill.domain})"
+                    )
+                    continue
+
                 skill.status = SkillStatus.DEPRECATED
                 skill.updated_at = datetime.now(timezone.utc)
                 self._persist_skill(skill)
@@ -908,6 +952,165 @@ class SkillLibrary:
                 )
             except FileNotFoundError:
                 pass
+
+    def _is_last_in_category(
+        self,
+        skill: SkillRecord,
+        all_active: list[SkillRecord],
+    ) -> bool:
+        """Check if this is the last active skill in its category.
+
+        A "category" is determined by the skill's source task_type.
+        If this is the only active skill from that task_type, pruning
+        it would eliminate coverage for that category.
+
+        Phase 3.5 addition: Prevents capability collapse from aggressive pruning.
+
+        Args:
+            skill: The skill being considered for pruning.
+            all_active: All currently active skills.
+
+        Returns:
+            True if this is the last skill in its category.
+        """
+        category = skill.source.task_type
+        same_category = [
+            s for s in all_active
+            if s.source.task_type == category
+            and s.name != skill.name
+            and s.is_active
+        ]
+        return len(same_category) == 0
+
+    def run_security_scan(
+        self,
+        execute_fn: object | None = None,
+    ) -> SecurityScanResult:
+        """Scan Ring 3 skills for security vulnerability patterns.
+
+        Checks instruction_fragment of all active Ring 3 skills against
+        known vulnerability patterns from core/tool-taxonomy.yaml.
+        Flagged skills are quarantined immediately (status -> QUARANTINED).
+
+        Called at maintenance frequency (every maintenance_interval_tasks tasks).
+
+        Args:
+            execute_fn: Optional ModelExecuteFn for LLM-assisted scanning
+                (Phase 4+). Phase 3.5 uses pattern matching only.
+
+        Returns:
+            SecurityScanResult with scan details.
+
+        SoK Agent Skills (arXiv:2602.20867): 26.1% vulnerability rate.
+        """
+        import re  # SF-8: word boundary matching
+
+        now = datetime.now(timezone.utc)
+
+        # Load vulnerability patterns from tool-taxonomy.yaml.
+        # If the file doesn't exist (Phase 3 tests, pre-Phase 3.5 deployments),
+        # skip the scan gracefully -- no patterns means nothing to check.
+        try:
+            config_raw = self.yaml_store.read_raw("core/tool-taxonomy.yaml")
+        except FileNotFoundError:
+            logger.debug(
+                "core/tool-taxonomy.yaml not found -- skipping security scan "
+                "(no vulnerability patterns configured)"
+            )
+            return SecurityScanResult(
+                id=generate_id("scan"),
+                created_at=now,
+                skills_scanned=0,
+                vulnerabilities_found=0,
+                quarantined_skills=[],
+                scan_details=[],
+            )
+        tt = config_raw.get("tool_taxonomy", {})
+        security = tt.get("security", {})
+        patterns = security.get("vulnerability_patterns", [])
+        quarantine_critical = bool(security.get("quarantine_on_critical", True))
+        quarantine_high = bool(security.get("quarantine_on_high", True))
+
+        # Get all Ring 3 skills (scan candidates, validated, and active --
+        # catch vulnerabilities BEFORE skills become active)
+        all_skills = self.get_all_skills()
+        ring_3_skills = [
+            s for s in all_skills
+            if s.ring == ProtectionRing.RING_3_EXPENDABLE.value
+            and s.status not in (
+                SkillStatus.DEPRECATED.value,
+                SkillStatus.REJECTED.value,
+                SkillStatus.QUARANTINED.value,
+            )
+        ]
+
+        scan_details: list[dict[str, str]] = []
+        quarantined: list[str] = []
+
+        for skill in ring_3_skills:
+            fragment_lower = skill.instruction_fragment.lower()
+            for pat in patterns:
+                pattern_text = pat.get("pattern", "").lower()
+                severity = pat.get("severity", "low")
+                # SF-8: Use word boundary regex to avoid false positives
+                # (e.g., "evaluation" should not match "eval(").
+                # Only add \b where the pattern has a word character at
+                # that boundary; non-word chars (like "(") already act
+                # as natural boundaries.
+                escaped = re.escape(pattern_text)
+                prefix = r'\b' if pattern_text and pattern_text[0].isalnum() else ''
+                suffix = r'\b' if pattern_text and pattern_text[-1].isalnum() else ''
+                if pattern_text and re.search(
+                    prefix + escaped + suffix, fragment_lower
+                ):
+                    detail = {
+                        "skill_name": skill.name,
+                        "pattern": pat.get("pattern", ""),
+                        "severity": severity,
+                        "description": pat.get("description", ""),
+                    }
+                    scan_details.append(detail)
+
+                    should_quarantine = (
+                        (severity == "critical" and quarantine_critical)
+                        or (severity == "high" and quarantine_high)
+                    )
+                    if should_quarantine and skill.name not in quarantined:
+                        skill.status = SkillStatus.QUARANTINED  # MF-4
+                        skill.updated_at = now
+                        self._persist_skill(skill)
+                        quarantined.append(skill.name)
+                        logger.warning(
+                            f"Skill '{skill.name}' QUARANTINED: "
+                            f"vulnerability pattern '{pat.get('pattern', '')}' "
+                            f"(severity: {severity})"
+                        )
+
+        result = SecurityScanResult(
+            id=generate_id("scan"),
+            created_at=now,
+            skills_scanned=len(ring_3_skills),
+            vulnerabilities_found=len(scan_details),
+            quarantined_skills=quarantined,
+            scan_details=scan_details,
+        )
+
+        # Persist scan result
+        self.yaml_store.ensure_dir(f"{self._skills_dir}/security-scans")
+        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        unique_suffix = result.id.split("-")[-1]
+        self.yaml_store.write(
+            f"{self._skills_dir}/security-scans/{timestamp_str}_{unique_suffix}.yaml",
+            result,
+        )
+
+        logger.info(
+            f"Security scan complete: {len(ring_3_skills)} Ring 3 skills scanned, "
+            f"{len(scan_details)} vulnerabilities found, "
+            f"{len(quarantined)} quarantined"
+        )
+
+        return result
 
     def _log_ring_transition(self, transition: RingTransition) -> None:
         """Log a ring transition to the EVOLUTION audit stream.

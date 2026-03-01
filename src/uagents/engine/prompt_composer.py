@@ -28,6 +28,8 @@ from ..state.yaml_store import YamlStore
 
 if TYPE_CHECKING:
     from .cache_manager import CacheManager
+    from .context_pressure_monitor import ContextPressureMonitor
+    from ..models.tool import ToolDefinition
 
 
 class PromptRing(IntEnum):
@@ -60,6 +62,7 @@ class ComposedPrompt(FrameworkModel):
     voice_profile: VoiceProfile
     tools_loaded: list[str]
     dropped_sections: list[str]  # Names of sections removed by compression
+    context_snapshot: ContextSnapshot | None = None  # Phase 3.5: IFM-N52 fix
 
 
 # Token estimation: 3.5 chars/token for English (cold start seed)
@@ -107,6 +110,8 @@ class PromptComposer:
         allocation: ContextBudgetAllocation | None = None,
         budget_summary: dict | None = None,
         cache_manager: CacheManager | None = None,
+        loaded_tools: list[ToolDefinition] | None = None,  # Phase 3.5 (MF-3)
+        context_pressure_monitor: ContextPressureMonitor | None = None,  # Phase 3.5 (MF-3)
     ) -> ComposedPrompt:
         """Full prompt composition pipeline.
 
@@ -128,7 +133,7 @@ class PromptComposer:
         sections.extend(ring_1_sections)
         sections.extend(self._build_ring_2(role, capabilities, voice_atoms,
                                             domain.voice_defaults))
-        sections.extend(self._build_ring_3(task))
+        sections.extend(self._build_ring_3(task, loaded_tools=loaded_tools))
 
         # FM-20: Cache-aware prefix marking
         if cache_manager is not None:
@@ -145,6 +150,45 @@ class PromptComposer:
         # 3. Determine compression stage
         utilization = total / max_tokens if max_tokens > 0 else 1.0
         stage = self._determine_compression_stage(utilization)
+
+        # Phase 3.5: Context budget enforcement
+        # MF-5: ContextPressureMonitor is the AUTHORITY for compression stage.
+        # PromptComposer._determine_compression_stage() remains as the FALLBACK
+        # when no ContextPressureMonitor is available.
+        context_snapshot = None  # IFM-N52: will be set on ComposedPrompt
+        if context_pressure_monitor is not None:
+            ring_0_tokens = sum(
+                s.token_estimate for s in sections
+                if s.ring == PromptRing.RING_0
+            )
+            system_tokens = sum(
+                s.token_estimate for s in sections
+                if s.ring in (PromptRing.RING_0, PromptRing.RING_1)
+            )
+            tool_tokens = sum(
+                s.token_estimate for s in sections
+                if s.name == "tool_definitions"
+            )
+            task_tokens = sum(
+                s.token_estimate for s in sections
+                if s.name == "task_context"
+            )
+            history_tokens = 0  # Conversation history managed externally
+            reserve_tokens = int(max_tokens * allocation.reserve_pct)
+
+            context_snapshot = context_pressure_monitor.compute_snapshot(
+                system_tokens=system_tokens,
+                tool_tokens=tool_tokens,
+                task_tokens=task_tokens,
+                history_tokens=history_tokens,
+                reserve_tokens=reserve_tokens,
+                ring_0_tokens=ring_0_tokens,
+                max_context_tokens=max_tokens,
+            )
+
+            # MF-5: ContextPressureMonitor is the AUTHORITY — override
+            # the locally-computed compression stage with the authoritative one
+            stage = context_snapshot.compression_stage
 
         # 4. Apply compression if needed
         dropped: list[str] = []
@@ -170,8 +214,9 @@ class PromptComposer:
             total_tokens=final_total,
             compression_stage=stage,
             voice_profile=voice_profile,
-            tools_loaded=[],  # Populated by tool loader
+            tools_loaded=[t.name for t in (loaded_tools or [])],  # Phase 3.5
             dropped_sections=dropped,
+            context_snapshot=context_snapshot if context_pressure_monitor is not None else None,  # IFM-N52
         )
 
     def _build_ring_0(self) -> list[PromptSection]:
@@ -322,8 +367,38 @@ class PromptComposer:
 
         return sections
 
-    def _build_ring_3(self, task: Task) -> list[PromptSection]:
-        """Task context and working memory."""
+    def _build_ring_3(
+        self,
+        task: Task,
+        loaded_tools: list[ToolDefinition] | None = None,  # MF-3: properly typed
+    ) -> list[PromptSection]:
+        """Task context, working memory, and dynamically loaded tools.
+
+        Phase 3.5: Tool definitions injected as Ring 3 sections with
+        lower priority than task context (dropped first under pressure).
+        """
+        sections: list[PromptSection] = []
+
+        # Tool definitions (Phase 3.5: dynamic tool injection)
+        if loaded_tools is not None:
+            tool_lines: list[str] = ["## Available Tools\n"]
+            for tool in loaded_tools:
+                tool_lines.append(f"### {tool.name}")
+                tool_lines.append(f"{tool.description}")
+                tool_lines.append(f"{tool.instruction_fragment}")
+                tool_lines.append("")
+
+            tool_content = "\n".join(tool_lines)
+            sections.append(PromptSection(
+                ring=PromptRing.RING_3,
+                name="tool_definitions",
+                content=tool_content,
+                token_estimate=estimate_tokens(tool_content),
+                compressible=True,
+                priority=0.4,  # Lower than task — dropped first under pressure
+            ))
+
+        # Task context
         task_content = (
             f"## Current Task: {task.title}\n\n"
             f"Status: {task.status}\n"
@@ -334,7 +409,7 @@ class PromptComposer:
             task_content += "\nConstraints:\n" + "\n".join(
                 f"- {c}" for c in task.mandate.constraints
             )
-        return [
+        sections.append(
             PromptSection(
                 ring=PromptRing.RING_3,
                 name="task_context",
@@ -343,7 +418,9 @@ class PromptComposer:
                 compressible=True,
                 priority=0.8,
             )
-        ]
+        )
+
+        return sections
 
     def _compose_voice_block(
         self,

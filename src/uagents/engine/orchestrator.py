@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..audit.logger import AuditLogger
@@ -24,11 +25,18 @@ from .topology_router import TopologyRouter
 
 if TYPE_CHECKING:
     from .budget_tracker import BudgetTracker
+    from .cache_manager import CacheManager
     from .capability_tracker import CapabilityTracker
+    from .context_pressure_monitor import ContextPressureMonitor
     from .cost_gate import CostGate
     from .diversity_engine import DiversityEngine
+    from .prompt_composer import PromptComposer
     from .rate_limiter import RateLimiter
+    from .ring_enforcer import RingEnforcer
+    from .self_reconfigurer import SelfReconfigurer
+    from .skill_library import SkillLibrary
     from .stagnation_detector import StagnationDetector
+    from .tool_loader import ToolLoader
 
 logger = logging.getLogger("uagents.orchestrator")
 
@@ -67,6 +75,15 @@ class Orchestrator:
         rate_limiter: RateLimiter | None = None,
         cost_gate: CostGate | None = None,
         capability_tracker: CapabilityTracker | None = None,
+        # Phase 3.5 (IFM-N51): All optional, stored as self._X attributes
+        constitution_path: Path | None = None,
+        prompt_composer: PromptComposer | None = None,
+        cache_manager: CacheManager | None = None,
+        skill_library: SkillLibrary | None = None,
+        context_pressure_monitor: ContextPressureMonitor | None = None,
+        tool_loader: ToolLoader | None = None,
+        ring_enforcer: RingEnforcer | None = None,
+        self_reconfigurer: SelfReconfigurer | None = None,
     ):
         self.yaml_store = yaml_store
         self.topology_router = topology_router
@@ -80,6 +97,20 @@ class Orchestrator:
         self.diversity_engine: DiversityEngine | None = None
         self.stagnation_detector: StagnationDetector | None = None
         self.capability_tracker = capability_tracker
+
+        # Phase 3.5 (IFM-N51): Optional components stored with underscore prefix
+        self._constitution_path = constitution_path
+        self._prompt_composer = prompt_composer
+        self._cache_manager = cache_manager
+        self._skill_library = skill_library
+        self._context_pressure_monitor = context_pressure_monitor
+        self._tool_loader = tool_loader
+        self._ring_enforcer = ring_enforcer
+        self._self_reconfigurer = self_reconfigurer
+
+        # Phase 3.5: Verify Ring 0 integrity at boot (if enforcer provided)
+        if self._ring_enforcer is not None:
+            self._ring_enforcer.verify_ring_0_integrity()
 
     def process_task(
         self, task_id: str, domain_config, actor: str = "orchestrator"

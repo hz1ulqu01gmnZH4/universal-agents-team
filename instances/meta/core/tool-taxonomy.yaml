@@ -1,0 +1,174 @@
+# Tool taxonomy and dynamic loading configuration
+# Spec reference: Section 20.3 (Dynamic Tool Loading)
+# Literature: JSPLIT (arXiv:2510.14537), RAG-MCP (arXiv:2505.03275)
+
+tool_taxonomy:
+
+  # --- Loading parameters ---
+  loading:
+    max_tools_per_step: 5        # Target 3-5, hard cap 5 (RAG-MCP finding)
+    max_mcp_servers: 3           # Hard limit on concurrent MCP servers
+    mcp_idle_timeout_minutes: 10 # Suggest unload after idle
+    tool_token_budget_pct: 0.15  # From context budget allocation
+    avg_tokens_per_tool: 450     # Empirical average for token estimation
+    high_token_threshold: 5000   # Flag tools consuming > this many tokens
+
+  # --- Tool categories (JSPLIT-inspired) ---
+  categories:
+    core:
+      description: "Always loaded — file ops, git, messaging"
+      ring: 1  # IFM-N62: Default Ring 1 (infrastructure), per-tool ring overrides below
+      always_loaded: true
+      tools:
+        - name: "constitution_check"
+          description: "Verify constitution integrity and constraints"
+          instruction_fragment: "Use constitution_check to verify Ring 0 constitution compliance."
+          tags: ["constitution", "safety", "integrity"]
+          token_cost: 300
+          ring: 0  # IFM-N62: Explicit Ring 0 — constitution checking is immutable
+        - name: "self_pruner"
+          description: "Manage skill pruning and capability protection"
+          instruction_fragment: "Use self_pruner to evaluate and prune low-performing skills."
+          tags: ["pruning", "skills", "maintenance"]
+          token_cost: 300
+          ring: 0  # IFM-N62: Explicit Ring 0 — pruning system is immutable
+        - name: "file_read"
+          description: "Read file contents"
+          instruction_fragment: "Use file_read to read file contents from disk."
+          tags: ["filesystem", "read", "io"]
+          token_cost: 200
+          # ring: inherited from category (Ring 1)
+        - name: "file_write"
+          description: "Write file contents"
+          instruction_fragment: "Use file_write to create or overwrite files."
+          tags: ["filesystem", "write", "io"]
+          token_cost: 200
+        - name: "git_ops"
+          description: "Git version control operations"
+          instruction_fragment: "Use git_ops for commits, diffs, log, and branch management."
+          tags: ["git", "version_control", "scm"]
+          token_cost: 300
+        - name: "send_message"
+          description: "Inter-agent messaging"
+          instruction_fragment: "Use send_message to communicate with other agents."
+          tags: ["messaging", "coordination", "communication"]
+          token_cost: 250
+        - name: "task_update"
+          description: "Update task status and metadata"
+          instruction_fragment: "Use task_update to change task status, add notes, or update progress."
+          tags: ["task", "lifecycle", "status"]
+          token_cost: 250
+
+    domain:
+      description: "Loaded when domain is active"
+      ring: 2
+      always_loaded: false
+      tools: []  # Domain-specific tools added per domain.yaml
+
+    task:
+      description: "Loaded per-task based on task type"
+      ring: 2
+      always_loaded: false
+      tools:
+        - name: "code_search"
+          description: "Search codebase for patterns and symbols"
+          instruction_fragment: "Use code_search to find code patterns, function definitions, and references across the codebase."
+          tags: ["code", "search", "grep", "symbols"]
+          token_cost: 400
+        - name: "test_runner"
+          description: "Run test suites and report results"
+          instruction_fragment: "Use test_runner to execute test suites, collect results, and report pass/fail status."
+          tags: ["testing", "pytest", "validation"]
+          token_cost: 350
+        - name: "code_review"
+          description: "Automated code review and quality checks"
+          instruction_fragment: "Use code_review to analyze code quality, find potential issues, and suggest improvements."
+          tags: ["review", "quality", "lint", "analysis"]
+          token_cost: 400
+
+    specialist:
+      description: "Loaded per-step via semantic retrieval"
+      ring: 3
+      always_loaded: false
+      tools:
+        - name: "web_search"
+          description: "Search the web for information"
+          instruction_fragment: "Use web_search to find current information, documentation, and resources on the web."
+          tags: ["web", "search", "internet", "research"]
+          token_cost: 350
+          mcp_server: "web-search"
+        - name: "arxiv_search"
+          description: "Search arXiv for academic papers"
+          instruction_fragment: "Use arxiv_search to find academic papers, preprints, and research publications."
+          tags: ["arxiv", "papers", "research", "academic"]
+          token_cost: 400
+          mcp_server: "arxiv-mcp-server"
+        - name: "memory_recall"
+          description: "Search persistent memory for prior work"
+          instruction_fragment: "Use memory_recall to search episodic, semantic, and procedural memories from prior sessions."
+          tags: ["memory", "recall", "history", "context"]
+          token_cost: 350
+          mcp_server: "universal-memory"
+
+  # --- MCP server configuration ---
+  mcp_servers:
+    universal-memory:
+      ring: 1  # Ring 1: always available (core infrastructure)
+      auto_start: true
+      idle_exempt: true  # Never idle-timeout (always needed)
+    web-search:
+      ring: 3
+      auto_start: false
+      idle_exempt: false
+    arxiv-mcp-server:
+      ring: 3
+      auto_start: false
+      idle_exempt: false
+
+  # --- Task type to tool mapping hints ---
+  # Used as fallback when semantic retrieval is insufficient
+  task_type_hints:
+    simple_fix: ["code_search", "test_runner"]
+    feature_small: ["code_search", "test_runner", "file_read"]
+    feature_medium: ["code_search", "test_runner", "code_review"]
+    feature_large: ["code_search", "test_runner", "code_review"]
+    research: ["web_search", "arxiv_search", "memory_recall"]
+    review: ["code_review", "code_search"]
+
+  # --- Security scanning ---
+  # IFM-N64: scan_interval_tasks removed — security scans run at maintenance
+  # frequency (every maintenance_interval_tasks tasks, default 20).
+  security:
+    vulnerability_patterns:
+      - pattern: "ignore previous instructions"
+        severity: "critical"
+        description: "Prompt injection attempt"
+      - pattern: "ignore all prior"
+        severity: "critical"
+        description: "Prompt injection attempt"
+      - pattern: "you are now"
+        severity: "high"
+        description: "Identity override attempt"
+      - pattern: "disregard safety"
+        severity: "critical"
+        description: "Safety bypass attempt"
+      - pattern: "bypass constitution"
+        severity: "critical"
+        description: "Constitution override attempt"
+      - pattern: "eval("
+        severity: "high"
+        description: "Code execution attempt"
+      - pattern: "exec("
+        severity: "high"
+        description: "Code execution attempt"
+      - pattern: "subprocess"
+        severity: "high"
+        description: "Shell execution attempt"
+      - pattern: "os.system"
+        severity: "high"
+        description: "Shell execution attempt"
+      - pattern: "__import__"
+        severity: "high"
+        description: "Dynamic import attempt"
+    quarantine_on_critical: true
+    quarantine_on_high: true
