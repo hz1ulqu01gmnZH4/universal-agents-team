@@ -24,6 +24,7 @@ from .team_manager import TeamManager, TeamCreationError
 from .topology_router import TopologyRouter
 
 if TYPE_CHECKING:
+    from .alignment_verifier import AlignmentVerifier
     from .budget_tracker import BudgetTracker
     from .cache_manager import CacheManager
     from .capability_tracker import CapabilityTracker
@@ -31,9 +32,12 @@ if TYPE_CHECKING:
     from .cost_gate import CostGate
     from .diversity_engine import DiversityEngine
     from .evolution_engine import EvolutionEngine
+    from .objective_anchor import ObjectiveAnchor
     from .prompt_composer import PromptComposer
+    from .quorum_manager import QuorumManager
     from .rate_limiter import RateLimiter
     from .ring_enforcer import RingEnforcer
+    from .risk_scorecard import RiskScorecard
     from .self_reconfigurer import SelfReconfigurer
     from .skill_library import SkillLibrary
     from .stagnation_detector import StagnationDetector
@@ -87,6 +91,11 @@ class Orchestrator:
         self_reconfigurer: SelfReconfigurer | None = None,
         # Phase 4: Evolution engine (optional)
         evolution_engine: EvolutionEngine | None = None,
+        # Phase 5: Governance components
+        quorum_manager: QuorumManager | None = None,
+        objective_anchor: ObjectiveAnchor | None = None,
+        risk_scorecard: RiskScorecard | None = None,
+        alignment_verifier: AlignmentVerifier | None = None,
     ):
         self.yaml_store = yaml_store
         self.topology_router = topology_router
@@ -111,6 +120,11 @@ class Orchestrator:
         self._ring_enforcer = ring_enforcer
         self._self_reconfigurer = self_reconfigurer
         self._evolution_engine = evolution_engine
+        # Phase 5: Governance
+        self._quorum_manager = quorum_manager
+        self._objective_anchor = objective_anchor
+        self._risk_scorecard = risk_scorecard
+        self._alignment_verifier = alignment_verifier
 
         # Phase 3.5: Verify Ring 0 integrity at boot (if enforcer provided)
         if self._ring_enforcer is not None:
@@ -300,6 +314,10 @@ class Orchestrator:
         # Evolution cooldown counts total completed tasks, not just successful ones.
         if self._evolution_engine is not None:
             self._evolution_engine.record_task_completion()
+
+        # Phase 5: Governance checks after task completion
+        self._check_governance_after_task()
+
         return task
 
     def record_task_outcome(
@@ -567,3 +585,176 @@ For each subtask, provide:
             trigger_detail=trigger_detail,
         )
         return self._evolution_engine.run_evolution(proposal)
+
+    # ── Phase 5: Governance integration ──
+
+    _task_completion_count: int = 0
+
+    def _check_governance_after_task(self) -> None:
+        """Run governance checks after task completion.
+
+        S-CR-01/02: CRITICAL risk and alignment failures raise errors
+        (not just logged). Governance controls must actually enforce.
+        """
+        self._task_completion_count += 1
+        task_count = self._task_completion_count
+
+        # AlignmentVerifier: periodic or post-Tier 2
+        if self._alignment_verifier is not None:
+            tier2_just_completed = self._last_evolution_was_tier2()
+            if self._alignment_verifier.should_check(
+                task_count, tier2_just_completed
+            ):
+                agent_data = self._collect_agent_alignment_data()
+                trigger = "post_tier2_evolution" if tier2_just_completed else "periodic"
+                report = self._alignment_verifier.run_checks(
+                    trigger=trigger,
+                    task_count=task_count,
+                    agent_data=agent_data,
+                )
+                if not report.overall_passed:
+                    # S-CR-02-FIX: Alignment failure must be enforced, not just logged
+                    logger.error(
+                        f"Alignment verification FAILED: {report.recommendations}"
+                    )
+                    from ..models.governance import HumanDecision
+                    from ..models.base import generate_id
+                    from datetime import datetime, timezone
+                    decision = HumanDecision(
+                        id=generate_id("hd"),
+                        created_at=datetime.now(timezone.utc),
+                        decision_type="alignment_failure",
+                        summary=(
+                            f"Alignment check failed ({trigger}). "
+                            f"Recommendations: {report.recommendations}"
+                        ),
+                        proposed_by="orchestrator",
+                        urgency="high",
+                        blocking=True,
+                    )
+                    self.yaml_store.write(
+                        f"state/governance/pending_human_decisions/{decision.id}.yaml",
+                        decision,
+                    )
+                    raise RuntimeError(
+                        f"Alignment verification FAILED. "
+                        f"Human decision queued: {decision.id}. "
+                        f"Recommendations: {report.recommendations}"
+                    )
+
+        # RiskScorecard: periodic (every 10 tasks)
+        if self._risk_scorecard is not None and task_count > 0 and task_count % 10 == 0:
+            metrics = self._collect_risk_metrics()
+            assessment = self._risk_scorecard.compute(metrics)
+            from ..models.governance import RiskLevel
+            if assessment.aggregate_level == RiskLevel.CRITICAL:
+                # S-CR-01-FIX: CRITICAL risk must halt, not just log
+                logger.error(
+                    f"Risk assessment CRITICAL: {assessment.aggregate_score:.2f}. "
+                    f"Halting: {assessment.halted_operations}"
+                )
+                if self._evolution_engine is not None:
+                    self._evolution_engine.pause(
+                        f"CRITICAL risk: {assessment.aggregate_score:.2f}. "
+                        f"Actions: {assessment.actions_required}"
+                    )
+                raise RuntimeError(
+                    f"CRITICAL risk assessment ({assessment.aggregate_score:.2f}). "
+                    f"Halted: {assessment.halted_operations}. "
+                    f"Actions: {assessment.actions_required}"
+                )
+            elif assessment.aggregate_level == RiskLevel.WARNING:
+                logger.warning(
+                    f"Risk assessment WARNING: {assessment.aggregate_score:.2f}"
+                )
+
+    def _last_evolution_was_tier2(self) -> bool:
+        """Check if the most recent evolution was Tier 2+.
+
+        S-CR-06-FIX: Read last evolution record instead of returning False.
+        """
+        if self._evolution_engine is None:
+            return False
+        records_dir = self.yaml_store.base_dir / "state/evolution/records"
+        if not records_dir.exists():
+            return False
+        record_files = sorted(
+            f for f in records_dir.iterdir()
+            if f.suffix in (".yaml", ".yml")
+        )
+        if not record_files:
+            return False
+        last_file = record_files[-1]
+        rel_path = str(last_file.relative_to(self.yaml_store.base_dir))
+        try:
+            data = self.yaml_store.read_raw(rel_path)
+        except FileNotFoundError:
+            return False
+        proposal = data.get("proposal", {})
+        tier = proposal.get("tier")
+        # Tier 2 = organizational, also catch higher tiers
+        if isinstance(tier, int):
+            return tier >= 2
+        if isinstance(tier, str):
+            try:
+                return int(tier) >= 2
+            except ValueError:
+                return tier in ("organizational", "framework", "constitutional")
+        return False
+
+    def _collect_agent_alignment_data(self) -> list[dict]:
+        """Collect alignment-relevant data for all registered agents.
+
+        S-CR-07/NFR-04-FIX: Marks incomplete metrics explicitly so
+        alignment checks can distinguish "no data" from "clean data".
+        """
+        agents_base = f"instances/{self.task_lifecycle.domain}/state/agents"
+        agents_dir = self.yaml_store.base_dir / agents_base
+        if not agents_dir.exists():
+            return []
+
+        agent_data: list[dict] = []
+        for agent_dir in sorted(agents_dir.iterdir()):
+            if not agent_dir.is_dir():
+                continue
+            status_path = f"{agents_base}/{agent_dir.name}/status.yaml"
+            try:
+                data = self.yaml_store.read_raw(status_path)
+                agent_id = data["id"]  # KeyError = fail-loud (NFR-05)
+                role = data["role"]    # KeyError = fail-loud (NFR-05)
+                agent_data.append({
+                    "agent_id": agent_id,
+                    "role": role,
+                    "capabilities": data.get("capabilities", []),
+                    # Phase 5: behavioral metrics not yet collected.
+                    # Marked absent so checks can skip vs. false-pass.
+                    "_metrics_available": False,
+                })
+            except FileNotFoundError:
+                continue
+            except KeyError as e:
+                raise RuntimeError(
+                    f"Agent status file {status_path} missing required "
+                    f"field: {e}. Cannot build alignment data."
+                )
+
+        return agent_data
+
+    def _collect_risk_metrics(self) -> dict[str, dict]:
+        """Collect risk metrics for all 10 dimensions.
+
+        S-CR-08/NFR-06-FIX: Marks metrics as unavailable rather than
+        providing empty dicts that score as "healthy".
+        """
+        dimensions = [
+            "operational", "evolutionary", "diversity", "knowledge",
+            "resource", "governance", "alignment", "calibration",
+            "environment", "complexity",
+        ]
+        # Phase 5: real metric collection deferred. Mark all as
+        # explicitly unavailable so RiskScorecard can score
+        # conservatively rather than defaulting to "healthy".
+        return {
+            dim: {"_metrics_available": False}
+            for dim in dimensions
+        }

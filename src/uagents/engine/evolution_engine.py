@@ -53,6 +53,30 @@ from .evolution_validator import EvolutionValidator
 from .map_elites_archive import MAPElitesArchive
 from .ring_enforcer import RingEnforcer, RingViolationError
 
+# Phase 5: Governance imports (conditional — works even if not installed)
+try:
+    from .quorum_manager import QuorumManager, QuorumError, InsufficientVotersError
+    from .objective_anchor import ObjectiveAnchor
+    from .objective_anchor import ObjectiveAlignmentError as AnchorAlignmentError
+    from .risk_scorecard import RiskScorecard
+    from .alignment_verifier import AlignmentVerifier
+except ImportError:  # pragma: no cover
+    import warnings
+    warnings.warn(
+        "Phase 5 governance modules not importable. "
+        "Tier 2 quorum, risk scorecard, and alignment verification "
+        "will not be available.",
+        ImportWarning,
+        stacklevel=2,
+    )
+    QuorumManager = None  # type: ignore[assignment,misc]
+    QuorumError = RuntimeError  # type: ignore[assignment,misc]
+    InsufficientVotersError = RuntimeError  # type: ignore[assignment,misc]
+    ObjectiveAnchor = None  # type: ignore[assignment,misc]
+    AnchorAlignmentError = RuntimeError  # type: ignore[assignment,misc]
+    RiskScorecard = None  # type: ignore[assignment,misc]
+    AlignmentVerifier = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("uagents.evolution_engine")
 
 
@@ -120,6 +144,11 @@ class EvolutionEngine:
         audit_logger: AuditLogger,
         ring_enforcer: RingEnforcer,  # FM-P4-29-FIX: Required, not optional
         domain: str = "meta",
+        # Phase 5: Optional governance components
+        quorum_manager: QuorumManager | None = None,
+        objective_anchor: ObjectiveAnchor | None = None,
+        risk_scorecard: RiskScorecard | None = None,
+        alignment_verifier: AlignmentVerifier | None = None,
     ):
         self.yaml_store = yaml_store
         self.git_ops = git_ops
@@ -130,6 +159,11 @@ class EvolutionEngine:
         self.audit_logger = audit_logger
         self.ring_enforcer = ring_enforcer
         self.domain = domain
+        # Phase 5: Governance components
+        self._quorum_manager = quorum_manager
+        self._objective_anchor = objective_anchor
+        self._risk_scorecard = risk_scorecard
+        self._alignment_verifier = alignment_verifier
 
         # Load config (fail-loud if missing)
         config_raw = yaml_store.read_raw("core/evolution.yaml")
@@ -258,15 +292,28 @@ class EvolutionEngine:
         # ── Step 3: PROPOSE — validate safety ──
         self._log_lifecycle(proposal, current_state)
 
-        # 3a. Tier check: Phase 4 only allows Tier 3
+        # 3a. Tier check (Phase 5: supports Tier 1-3)
         tier_int = int(proposal.tier)
 
-        if tier_int != EvolutionTier.OPERATIONAL:
-            reason = (
-                f"Phase 4 only supports Tier 3 (operational) evolution. "
-                f"Received Tier {tier_int}. Tier 0-2 evolutions require Phase 5."
+        if tier_int == EvolutionTier.CONSTITUTIONAL:
+            return self._reject(
+                proposal,
+                "Tier 0 (constitutional) evolution is NEVER allowed programmatically.",
+                now,
             )
-            return self._reject(proposal, reason, now)
+        if tier_int == EvolutionTier.FRAMEWORK:
+            # Tier 1: queue for human approval (Phase 5 creates queue entry only)
+            return self._queue_for_human(proposal, now)
+        if tier_int == EvolutionTier.ORGANIZATIONAL:
+            # Tier 2: requires quorum approval
+            if self._quorum_manager is None:
+                return self._reject(
+                    proposal,
+                    "Tier 2 (organizational) evolution requires QuorumManager "
+                    "(Phase 5 governance). QuorumManager not configured.",
+                    now,
+                )
+        # Tier 3 falls through to existing auto-approval path
 
         # 3b. Safety checks
         safety_ok, safety_reason = self._check_proposal_safety(proposal)
@@ -355,6 +402,33 @@ class EvolutionEngine:
         if verdict_str == str(EvolutionOutcome.HELD):
             self.dual_copy_manager.cleanup_fork(candidate)
             return self._hold(proposal, evaluation, now)
+
+        # M-02-FIX: Two-phase quorum for Tier 2.
+        # Phase 1: Create quorum session and return HELD record.
+        # Phase 2: External code collects votes, then calls complete_tier2_evolution().
+        if tier_int == EvolutionTier.ORGANIZATIONAL:
+            try:
+                quorum_session_id = self._initiate_tier2_quorum(proposal)
+            except (InsufficientVotersError, QuorumError) as e:
+                self.dual_copy_manager.cleanup_fork(candidate)
+                return self._reject(
+                    proposal,
+                    f"Quorum process failed: {e}",
+                    now,
+                    evaluation=evaluation,
+                )
+
+            # Return HELD record — evolution paused pending quorum vote collection
+            record = self._create_held_record(
+                proposal, evaluation, candidate, now,
+                f"Awaiting Tier 2 quorum: session {quorum_session_id}",
+            )
+            logger.info(
+                f"Evolution {proposal.id} HELD pending quorum session {quorum_session_id}"
+            )
+            return record
+        # Tier 3 continues with auto-approval
+        approved_by = "auto (tier 3)"
 
         # ── Step 6: COMMIT — promote fork + git commit ──
         current_state = EvolutionLifecycleState.COMMIT
@@ -677,25 +751,51 @@ class EvolutionEngine:
         return True
 
     def _check_objective_alignment(self) -> None:
-        """Check if current behavior aligns with constitutional objectives.
+        """Check objective alignment using ObjectiveAnchor (Phase 5) or
+        built-in heuristic (Phase 4 fallback).
 
-        Called every N evolution cycles (objective_anchoring.check_every_n_cycles).
-        If alignment score drops below threshold, pauses evolution and raises
-        ObjectiveAlignmentError.
+        M-04-FIX: Uses canonical ObjectiveAlignmentError from evolution_engine.
+        ObjectiveAnchor.check_alignment() raises AnchorAlignmentError which
+        is caught and re-raised as the canonical type.
 
         FM-P4-48-FIX: Sets persistent pause flag on alignment failure.
         """
-        # Scan evolution records directory
+        if self._objective_anchor is not None:
+            try:
+                result = self._objective_anchor.check_alignment(
+                    self._state.evolution_count
+                )
+            except AnchorAlignmentError as e:
+                # Re-raise as canonical type for consistent handling
+                self._state.paused = True
+                self._state.pause_reason = str(e)
+                self._save_state()
+                raise ObjectiveAlignmentError(str(e)) from e
+
+            if not result.passed:
+                self._state.paused = True
+                self._state.pause_reason = (
+                    f"Objective alignment concern: {result.detail}"
+                )
+                self._save_state()
+                raise ObjectiveAlignmentError(
+                    f"ObjectiveAnchor check failed: {result.detail}. "
+                    f"Evolution paused."
+                )
+            return
+
+        # Phase 4 heuristic fallback (unchanged from Phase 4)
+        # S-06-FIX: Phase 4 uses 50% threshold (hardcoded). ObjectiveAnchor
+        # uses 80% (from config). When ObjectiveAnchor is None (Phase 4 mode),
+        # the 50% heuristic remains active.
         records_dir = self.yaml_store.base_dir / self._records_dir
         if not records_dir.exists() or not records_dir.is_dir():
-            # If evolutions have been counted, records dir MUST exist
             raise EvolutionError(
                 f"Objective alignment check triggered at evolution "
                 f"#{self._state.evolution_count} but records directory "
                 f"'{records_dir}' does not exist. Persistence is broken."
             )
 
-        # Load last 10 records
         record_files = sorted(
             f for f in records_dir.iterdir() if f.suffix in (".yaml", ".yml")
         )
@@ -708,7 +808,6 @@ class EvolutionEngine:
                 f"in '{records_dir}'."
             )
 
-        # Count outcomes
         rejected_or_rolled_back = 0
         total = 0
         for rf in recent:
@@ -736,7 +835,6 @@ class EvolutionEngine:
         )
 
         if failure_rate > 0.5:
-            # FM-P4-48-FIX: Set persistent pause flag
             self._state.paused = True
             self._state.pause_reason = (
                 f"Objective alignment concern: {failure_rate:.0%} of recent "
@@ -849,3 +947,345 @@ class EvolutionEngine:
                     f"consecutively. Halting evolution. Last error: {e}"
                 ) from e
         # ValueError/TypeError indicate bugs — propagate
+
+    # ── Phase 5: Governance methods ──
+
+    def _initiate_tier2_quorum(self, proposal: EvolutionProposal) -> str:
+        """Phase 1: Create quorum session for a Tier 2 proposal.
+
+        M-02-FIX: Two-phase design. This method creates the session and
+        returns its ID. Votes are collected externally (by the orchestrator
+        or run loop). complete_tier2_evolution() is called after votes arrive.
+
+        Returns:
+            Quorum session ID.
+
+        Raises:
+            InsufficientVotersError: If not enough eligible voters.
+            QuorumError: If quorum creation fails.
+        """
+        if self._quorum_manager is None:
+            raise QuorumError(
+                "QuorumManager not configured — cannot run Tier 2 quorum"
+            )
+
+        role_registry = self._build_role_registry()
+        session = self._quorum_manager.create_session(
+            proposal, role_registry, proposer_role=""
+        )
+        return session.id
+
+    def complete_tier2_evolution(
+        self, proposal_id: str, quorum_session_id: str
+    ) -> EvolutionRecord:
+        """Phase 2: Complete a HELD Tier 2 evolution after quorum votes collected.
+
+        M-02-FIX: Called by orchestrator/run loop after external vote collection.
+        Tallies votes and either promotes or rejects the held evolution.
+
+        Args:
+            proposal_id: The evolution proposal ID.
+            quorum_session_id: The quorum session to tally.
+
+        Returns:
+            Updated EvolutionRecord (PROMOTED or REJECTED).
+
+        Raises:
+            QuorumError: If tally fails.
+            EvolutionError: If proposal or held record not found.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Load the held record
+        held_record = self._load_held_record(proposal_id)
+        if held_record is None:
+            raise EvolutionError(
+                f"No HELD record found for proposal {proposal_id}"
+            )
+
+        # Check for timeout first
+        if self._quorum_manager.check_timeout(quorum_session_id):
+            self.dual_copy_manager.cleanup_fork(
+                self._load_candidate(held_record)
+            )
+            return self._transition_held_to_rejected(
+                held_record,
+                f"Quorum session {quorum_session_id} timed out",
+                now,
+            )
+
+        # Tally votes
+        quorum_result = self._quorum_manager.tally(quorum_session_id)
+
+        if not quorum_result.approved:
+            candidate = self._load_candidate(held_record)
+            self.dual_copy_manager.cleanup_fork(candidate)
+            reject_count = sum(1 for v in quorum_result.votes if v.vote == "reject")
+            return self._transition_held_to_rejected(
+                held_record,
+                f"Quorum rejected: {reject_count}/{len(quorum_result.votes)} reject "
+                f"(threshold: {quorum_result.threshold:.0%})",
+                now,
+            )
+
+        # Quorum approved — promote
+        approved_by = (
+            f"quorum ({sum(1 for v in quorum_result.votes if v.vote == 'approve')}"
+            f"/{len(quorum_result.votes)} approve)"
+        )
+        return self._promote_held_record(
+            held_record, quorum_result, approved_by, now
+        )
+
+    def _build_role_registry(self) -> list[dict]:
+        """Build role registry from compositions + role metadata.
+
+        FM-P5-34-FIX: Role compositions don't contain runtime fields
+        (task_count, lineage_id). These come from a separate role metadata
+        file at state/roles/role_metadata.yaml, maintained by the
+        orchestrator as agents complete tasks.
+
+        Compositions provide: name, scout_config.
+        Role metadata provides: task_count, lineage_id, created_by_evolution.
+
+        Returns list of role info dicts for quorum eligibility computation.
+        Sorted deterministically by name (FM-P5-63-FIX).
+        """
+        compositions_dir = self.yaml_store.base_dir / "roles" / "compositions"
+        if not compositions_dir.exists():
+            return []
+
+        # Load role metadata (runtime stats)
+        try:
+            metadata = self.yaml_store.read_raw("state/roles/role_metadata.yaml")
+        except FileNotFoundError:
+            logger.warning(
+                "state/roles/role_metadata.yaml not found — "
+                "no roles will meet maturity requirement"
+            )
+            metadata = {}
+
+        registry: list[dict] = []
+        # FM-P5-63-FIX: Sort files for deterministic ordering
+        for comp_file in sorted(compositions_dir.iterdir()):
+            if comp_file.suffix not in (".yaml", ".yml"):
+                continue
+            try:
+                rel_path = str(comp_file.relative_to(self.yaml_store.base_dir))
+                data = self.yaml_store.read_raw(rel_path)
+
+                role_name = data["name"]  # KeyError = fail-loud (FM-P5-34)
+                role_meta = metadata.get(role_name, {})
+
+                registry.append({
+                    "name": role_name,
+                    "task_count": int(role_meta.get("task_count", 0)),
+                    "lineage_id": str(role_meta.get("lineage_id", "")),
+                    "created_by_evolution": str(role_meta.get("created_by_evolution", "")),
+                    "is_scout": data.get("scout_config") is not None,
+                })
+            except KeyError as e:
+                raise EvolutionError(
+                    f"Role composition {comp_file.name} missing required "
+                    f"field {e}. Fix the composition file."
+                )
+            except (FileNotFoundError, ValueError) as e:
+                logger.warning(f"Skipping role composition {comp_file}: {e}")
+
+        return registry
+
+    def _queue_for_human(
+        self, proposal: EvolutionProposal, now: datetime
+    ) -> EvolutionRecord:
+        """Queue a Tier 1 proposal for human approval.
+
+        Phase 5: Creates queue entry but does NOT process. The autonomous
+        run loop (Phase 6+) will present these to the human.
+        """
+        from ..models.governance import HumanDecision
+
+        decision = HumanDecision(
+            id=generate_id("hd"),
+            created_at=now,
+            decision_type="tier1_evolution_approval",
+            summary=f"Tier 1 evolution: {proposal.rationale}",
+            proposed_by="evolution_engine",
+            blocking=False,
+            blocking_tasks=[],
+        )
+
+        # Persist to human decision queue
+        queue_path = "state/governance/pending_human_decisions"
+        self.yaml_store.write(f"{queue_path}/{decision.id}.yaml", decision)
+
+        logger.info(
+            f"Tier 1 proposal {proposal.id} queued for human approval: {decision.id}"
+        )
+
+        return self._reject(
+            proposal,
+            f"Tier 1 proposals require human approval. Queued as {decision.id}.",
+            now,
+        )
+
+    def _create_held_record(
+        self,
+        proposal: EvolutionProposal,
+        evaluation: EvaluationResult,
+        candidate: DualCopyCandidate,
+        now: datetime,
+        reason: str,
+    ) -> EvolutionRecord:
+        """Create a HELD evolution record for Tier 2 pending quorum.
+
+        FM-P5-58: Helper for the two-phase quorum API. Persists the
+        candidate info so complete_tier2_evolution() can resume later.
+        """
+        record = EvolutionRecord(
+            id=generate_id("evo"),
+            created_at=now,
+            proposal=proposal,
+            evaluation=evaluation,
+            outcome=EvolutionOutcome.HELD,
+            approved_by=reason,
+            constitutional_check="pass",
+        )
+        # Persist record and candidate reference
+        self.yaml_store.write(
+            f"state/evolution/records/{record.id}.yaml", record
+        )
+        self.yaml_store.write(
+            f"state/evolution/candidates/{proposal.id}/held_candidate.yaml",
+            candidate,
+        )
+        # S-CR-03-FIX: Do NOT increment evolution_count here.
+        # Counter only increments on actual PROMOTED outcome
+        # (in _promote_held_record or Tier 3 commit path).
+        return record
+
+    def _load_held_record(self, proposal_id: str) -> EvolutionRecord | None:
+        """Load a HELD record by proposal ID (FM-P5-59)."""
+        records_dir = self.yaml_store.base_dir / "state/evolution/records"
+        if not records_dir.exists():
+            return None
+        for f in sorted(records_dir.iterdir()):
+            if f.suffix not in (".yaml", ".yml"):
+                continue
+            data = self.yaml_store.read_raw(str(f.relative_to(self.yaml_store.base_dir)))
+            if (data.get("proposal", {}).get("id") == proposal_id
+                    and data.get("outcome") == "held"):
+                return self.yaml_store.read(
+                    str(f.relative_to(self.yaml_store.base_dir)),
+                    EvolutionRecord,
+                )
+        return None
+
+    def _load_candidate(self, held_record: EvolutionRecord) -> DualCopyCandidate:
+        """Load DualCopyCandidate from a HELD record (FM-P5-60)."""
+        proposal_id = held_record.proposal.id
+        path = f"state/evolution/candidates/{proposal_id}/held_candidate.yaml"
+        return self.yaml_store.read(path, DualCopyCandidate)
+
+    def _transition_held_to_rejected(
+        self,
+        held_record: EvolutionRecord,
+        reason: str,
+        now: datetime,
+    ) -> EvolutionRecord:
+        """Transition a HELD record to REJECTED (FM-P5-61)."""
+        held_record.outcome = EvolutionOutcome.REJECTED
+        held_record.approved_by = reason
+        self.yaml_store.write(
+            f"state/evolution/records/{held_record.id}.yaml",
+            held_record,
+        )
+        return held_record
+
+    def _promote_held_record(
+        self,
+        held_record: EvolutionRecord,
+        quorum_result,
+        approved_by: str,
+        now: datetime,
+    ) -> EvolutionRecord:
+        """Promote a HELD record after quorum approval (FM-P5-62).
+
+        S-CR-04-FIX: Includes Git commit, ring enforcement, and
+        post-commit verification — same safety as Tier 3 path.
+        """
+        candidate = self._load_candidate(held_record)
+
+        # Create rollback point before promotion
+        rollback_sha = self.git_ops.create_rollback_point()
+
+        # Promote: copy fork files to active positions
+        self.dual_copy_manager.promote(candidate)
+
+        # Git commit
+        git_files = self._git_paths(candidate)
+        try:
+            evolution_sha = self.git_ops.commit_evolution(
+                evo_id=held_record.proposal.id,
+                tier=int(held_record.proposal.tier),
+                rationale=held_record.proposal.rationale,
+                approved_by=approved_by,
+                files=git_files,
+            )
+        except GitOpsError as e:
+            logger.error(f"Git commit failed for {held_record.id}: {e}")
+            if candidate.promoted:
+                try:
+                    self.git_ops.rollback_to(rollback_sha)
+                except GitOpsError as re:
+                    self._state.paused = True
+                    self._state.pause_reason = (
+                        f"CRITICAL: Tier 2 commit failed AND rollback failed "
+                        f"for {held_record.id}. Error: {e}. Rollback: {re}"
+                    )
+                    self._save_state()
+                    raise EvolutionError(
+                        f"Tier 2 commit and rollback both failed for "
+                        f"{held_record.id}. Manual intervention required."
+                    ) from re
+            self.dual_copy_manager.cleanup_fork(candidate)
+            return self._transition_held_to_rejected(
+                held_record, f"Git commit failed: {e}", now,
+            )
+
+        # Ring enforcement verification
+        try:
+            self.ring_enforcer.verify_no_ring_0_modification(git_files)
+        except RingViolationError as e:
+            logger.error(
+                f"Ring 0 violation in Tier 2 promotion {held_record.id}: {e}"
+            )
+            self.git_ops.rollback_to(rollback_sha)
+            self.dual_copy_manager.cleanup_fork(candidate)
+            return self._transition_held_to_rejected(
+                held_record, f"Ring 0 violation: {e}", now,
+            )
+
+        self.dual_copy_manager.cleanup_fork(candidate)
+
+        held_record.outcome = EvolutionOutcome.PROMOTED
+        held_record.approved_by = approved_by
+        held_record.quorum = quorum_result
+        held_record.evolution_commit = evolution_sha
+        held_record.rollback_commit = rollback_sha
+        held_record.verification_passed = True
+        self.yaml_store.write(
+            f"state/evolution/records/{held_record.id}.yaml",
+            held_record,
+        )
+
+        # S-CR-03-FIX: Increment evolution count only on PROMOTED
+        self._state.evolution_count += 1
+        self._save_state()
+
+        # Update archive
+        self.archive.update_from_evolution(held_record)
+
+        logger.info(
+            f"Evolution {held_record.id} PROMOTED via quorum: {approved_by}"
+        )
+        return held_record

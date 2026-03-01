@@ -43,6 +43,19 @@ class DirectoryManager:
         "state/evolution/proposals/",
         "state/evolution/candidates/",
         "state/evolution/archive/",
+        # S-07-FIX: Missing evolution directories from Phase 4
+        "state/evolution/records/",
+        "state/evolution/evaluations/",
+        # FM-P5-34-FIX: Role metadata directory
+        "state/roles/",
+        # Phase 5: Governance directories
+        "state/governance/",
+        "state/governance/quorum_sessions/",
+        "state/governance/quorum_votes/",
+        "state/governance/alignment_results/",
+        "state/governance/alignment_reports/",
+        "state/governance/risk_assessments/",
+        "state/governance/pending_human_decisions/",
         "state/coordination/",
         "state/coordination/pressure-fields/",
         "logs/",

@@ -110,3 +110,19 @@ class TraceLogEntry(BaseLogEntry):
     stream: Literal[LogStream.TRACES] = LogStream.TRACES
     level: Literal["operational", "cognitive", "contextual"]
     detail: dict
+
+
+class GovernanceLogEntry(BaseLogEntry):
+    """Governance audit log entry — Phase 5.
+
+    Tracks quorum sessions, risk assessments, alignment checks,
+    and human decision queue events.
+    """
+
+    stream: Literal[LogStream.EVOLUTION] = LogStream.EVOLUTION
+    event_type: str  # "quorum_session", "risk_assessment", "alignment_check", "human_decision"
+    proposal_id: str = ""
+    quorum_session_id: str = ""
+    risk_aggregate: float = 0.0
+    alignment_passed: bool = True
+    detail: str = ""

@@ -1,0 +1,100 @@
+# Self-governance configuration — Phase 5 (Governance)
+# Spec reference: Section 14 (Self-Governance)
+#
+# Controls quorum voting, objective anchoring, risk assessment,
+# and alignment verification behavior.
+
+self_governance:
+  quorum:
+    minimum_voters: 3
+    threshold: 0.67
+    min_tasks_for_voter: 10
+    max_voters_per_lineage: 1
+    scout_required: true
+    vote_timeout_minutes: 30
+    sealed_votes: true
+
+  objective_anchoring:
+    check_every_n_cycles: 10
+    min_alignment_score: 0.8
+    method: evolution_success_rate
+    recent_window: 10
+    halt_on_failure: true
+
+  risk_scorecard:
+    dimensions:
+      operational:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      evolutionary:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      diversity:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      knowledge:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      resource:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      governance:
+        weight: 2.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      alignment:
+        weight: 2.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      calibration:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      environment:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+      complexity:
+        weight: 1.0
+        healthy_threshold: 0.3
+        warning_threshold: 0.5
+        critical_threshold: 0.7
+    aggregate_thresholds:
+      healthy: 0.3
+      warning: 0.5
+      critical: 0.7
+
+  alignment_verification:
+    check_every_n_tasks: 20
+    check_after_tier2_evolution: true
+    checks:
+      behavioral_consistency:
+        enabled: true
+        min_confidence: 0.7
+      capability_elicitation:
+        enabled: true
+        min_confidence: 0.6
+      cross_agent_monitoring:
+        enabled: true
+        min_confidence: 0.7
+      red_team:
+        enabled: false
+        min_confidence: 0.5
+
+  human_decision_queue:
+    storage_path: state/governance/pending_human_decisions
+    max_pending: 20

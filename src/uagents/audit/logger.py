@@ -2,7 +2,7 @@
 Spec reference: Section 17 (Audit System & Viewers)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..models.audit import (
@@ -11,11 +11,13 @@ from ..models.audit import (
     DiversityLogEntry,
     EnvironmentLogEntry,
     EvolutionLogEntry,
+    GovernanceLogEntry,
     LogStream,
     ResourceLogEntry,
     TaskLogEntry,
     TraceLogEntry,
 )
+from ..models.base import generate_id
 from ..state.jsonl_writer import JsonlWriter
 
 
@@ -55,6 +57,28 @@ class AuditLogger:
 
     def log_trace(self, entry: TraceLogEntry) -> None:
         self.writers[LogStream.TRACES].append(entry)
+
+    def log_governance(
+        self,
+        event_type: str,
+        proposal_id: str = "",
+        quorum_session_id: str = "",
+        risk_aggregate: float = 0.0,
+        alignment_passed: bool = True,
+        detail: str = "",
+    ) -> None:
+        """Log a governance event (S-03-FIX)."""
+        entry = GovernanceLogEntry(
+            id=generate_id("govlog"),
+            timestamp=datetime.now(timezone.utc),
+            event_type=event_type,
+            proposal_id=proposal_id,
+            quorum_session_id=quorum_session_id,
+            risk_aggregate=risk_aggregate,
+            alignment_passed=alignment_passed,
+            detail=detail,
+        )
+        self.writers[LogStream.EVOLUTION].append(entry)
 
     def query(
         self,
