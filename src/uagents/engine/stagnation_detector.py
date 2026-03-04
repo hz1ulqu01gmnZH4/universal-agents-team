@@ -38,6 +38,7 @@ SRD_STAGNATION_THRESHOLD = 0.4     # SRD below this for 3 tasks
 SRD_CONSECUTIVE_THRESHOLD = 3
 FRAMEWORK_EVOLUTION_THRESHOLD = 10  # No Tier 2+ evo in this many tasks
 FRAMEWORK_TOPOLOGY_THRESHOLD = 10   # Same topology for this many tasks
+ARCHIVE_STALENESS_THRESHOLD = 20    # No MAP-Elites cell replacement in this many tasks
 
 
 class StagnationDetector:
@@ -64,6 +65,7 @@ class StagnationDetector:
         self._topology_history: deque[str] = deque(maxlen=20)
         self._tone_history: deque[set[str]] = deque(maxlen=20)
         self._tasks_since_evolution: int = 0
+        self._tasks_since_archive_update: int = 0
 
         # Load persisted state
         self._load_state()
@@ -95,6 +97,7 @@ class StagnationDetector:
         if agent_tones is not None:
             self._tone_history.append(agent_tones)
         self._tasks_since_evolution += 1
+        self._tasks_since_archive_update += 1
 
         # Check team-level SRD stagnation
         team_signal = self._check_team_srd()
@@ -166,11 +169,25 @@ class StagnationDetector:
             )
         return None
 
+    def check_framework_stagnation(self) -> list[StagnationSignal]:
+        """Public wrapper for framework-level stagnation checks.
+
+        Used by orchestrator to check framework stagnation independently
+        of the full check_all() flow (e.g., for solo tasks that don't
+        produce diversity measurements).
+        """
+        return self._check_framework_stagnation()
+
     def record_evolution(self, tier: int) -> None:
         """Record that an evolution occurred. Resets framework counter if Tier >= 2."""
         if tier >= 2:
             self._tasks_since_evolution = 0
             self._save_state()
+
+    def record_archive_update(self) -> None:
+        """Record that a MAP-Elites archive cell was replaced. Resets counter."""
+        self._tasks_since_archive_update = 0
+        self._save_state()
 
     def _check_team_srd(self) -> StagnationSignal | None:
         """SRD < 0.4 for 3 consecutive tasks → team-level stagnation."""
@@ -257,6 +274,24 @@ class StagnationDetector:
                 consecutive_count=self._tasks_since_evolution,
             ))
 
+        # MAP-Elites archive staleness: no cell replacement in N tasks
+        # FM-P7-057-FIX: Only fire at multiples of threshold (FM-104 pattern)
+        if (
+            self._tasks_since_archive_update >= ARCHIVE_STALENESS_THRESHOLD
+            and self._tasks_since_archive_update % ARCHIVE_STALENESS_THRESHOLD == 0
+        ):
+            signals.append(StagnationSignal(
+                level=StagnationLevel.FRAMEWORK,
+                description=(
+                    f"MAP-Elites archive stale: no cell replacement in "
+                    f"{self._tasks_since_archive_update} tasks"
+                ),
+                metric_name="tasks_since_archive_update",
+                metric_value=float(self._tasks_since_archive_update),
+                threshold=float(ARCHIVE_STALENESS_THRESHOLD),
+                consecutive_count=self._tasks_since_archive_update,
+            ))
+
         # Same topology for 10 consecutive tasks
         recent_topo = list(self._topology_history)[-FRAMEWORK_TOPOLOGY_THRESHOLD:]
         if len(recent_topo) >= FRAMEWORK_TOPOLOGY_THRESHOLD:
@@ -281,6 +316,7 @@ class StagnationDetector:
             "topology_history": list(self._topology_history),
             "tone_history": [list(s) for s in self._tone_history],
             "tasks_since_evolution": self._tasks_since_evolution,
+            "tasks_since_archive_update": self._tasks_since_archive_update,
         }
         self.yaml_store.write_raw(f"{self._stagnation_base}/state.yaml", state)
 
@@ -302,6 +338,9 @@ class StagnationDetector:
             for v in state.get("tone_history", []):
                 self._tone_history.append(set(v))
             self._tasks_since_evolution = int(state.get("tasks_since_evolution", 0))
+            # FM-P7-056-FIX: FM-119 backward-compat pattern — .get() with default
+            # is acceptable for state loading (older state files won't have this key)
+            self._tasks_since_archive_update = int(state.get("tasks_since_archive_update", 0))
         except Exception as e:
             # FM-119: Corrupt/missing YAML — start with empty state
             if not isinstance(e, FileNotFoundError):

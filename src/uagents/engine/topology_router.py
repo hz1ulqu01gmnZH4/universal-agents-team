@@ -10,6 +10,8 @@ from ..models.audit import DecisionLogEntry, LogStream
 from ..models.base import FrameworkModel, generate_id
 from ..models.task import Task
 
+logger = logging.getLogger("uagents.topology_router")
+
 
 class Decomposability(StrEnum):
     MONOLITHIC = "monolithic"
@@ -115,9 +117,10 @@ class TopologyRouter:
     def __init__(
         self,
         yaml_store: "YamlStore",
-        resource_tracker: "ResourceTracker",
+        resource_tracker: "ResourceTracker | None" = None,
         domain: str = "meta",
         audit_logger: "AuditLogger | None" = None,
+        map_elites_archive: "MAPElitesArchive | None" = None,
     ):
         from ..audit.logger import AuditLogger
         from ..engine.resource_tracker import ResourceTracker
@@ -127,6 +130,7 @@ class TopologyRouter:
         self.resource_tracker = resource_tracker
         self._tasks_base = f"instances/{domain}/state/tasks"
         self.audit_logger = audit_logger
+        self._archive = map_elites_archive
 
     def analyze(self, task: Task) -> TaskAnalysis:
         """Analyze task along 6 dimensions using structured heuristics.
@@ -228,18 +232,20 @@ class TopologyRouter:
             return Novelty.NOVEL  # No history -> novel
 
         max_similarity = 0.0
-        for task_file in completed_tasks[:50]:  # Check last 50 completed
+        yaml_tasks = [f for f in completed_tasks if f.endswith((".yaml", ".yml"))]
+        for task_file in yaml_tasks[:50]:  # Check last 50 completed
             try:
                 data = self.yaml_store.read_raw(f"{completed_dir}/{task_file}")
-                past_title = data.get("title", "")
+                # IFM-N53: fail-loud — task files must have a title field
+                past_title = data["title"]
                 past_words = set(past_title.lower().split())
                 if title_words and past_words:
                     intersection = title_words & past_words
                     union = title_words | past_words
                     similarity = len(intersection) / len(union)  # Jaccard
                     max_similarity = max(max_similarity, similarity)
-            except Exception as e:
-                logging.getLogger("uagents.topology_router").debug(
+            except (FileNotFoundError, OSError) as e:
+                logger.warning(
                     f"Skipping unreadable task file {task_file} in novelty check: {e}"
                 )
                 continue
@@ -251,7 +257,7 @@ class TopologyRouter:
         else:
             return Novelty.NOVEL
 
-    def route(self, analysis: TaskAnalysis) -> RoutingResult:
+    def route(self, analysis: TaskAnalysis, task: "Task | None" = None) -> RoutingResult:
         """Select topology pattern based on 6-dimension analysis.
 
         Phase 1 implements 3 patterns:
@@ -260,7 +266,16 @@ class TopologyRouter:
         - hierarchical_team: everything else (default)
 
         All topologies include a mandatory reviewer agent.
+
+        Phase 7: Optionally consults MAP-Elites archive for topology hint.
         """
+        # Phase 7: Archive consultation (advisory only)
+        if task is not None:
+            archive_hint = self._consult_archive(task)
+            if archive_hint:
+                logger.info(f"Archive suggests topology: {archive_hint}")
+                # Advisory logging only in Phase 7 — full integration in Phase 8
+
         # Check available resources for topology downgrade decisions
         can_spawn, spawn_reason = self.resource_tracker.can_spawn_agent()
         metrics = self.resource_tracker.check_compute()
@@ -322,6 +337,29 @@ class TopologyRouter:
                 rationale=f"Fully decomposable + independent -> parallel swarm ({actual_count} workers)",
             )
 
+        # Phase 6: Creative/novel tasks use debate topology
+        # Note: UNPRECEDENTED is excluded from solo routing (line 287), and
+        # this check comes after parallel_swarm, so debate only fires for
+        # tasks that are NOT fully_decomposable+independent (correct: debate
+        # tasks inherently involve coupled reasoning).
+        if (analysis.novelty == Novelty.UNPRECEDENTED
+                and analysis.exploration_vs_execution == ExplorationExecution.PURE_EXPLORATION
+                and analysis.quality_criticality in (QualityCriticality.HIGH, QualityCriticality.CRITICAL)):
+            # FM-P6-IMP-017-FIX: Include mandatory reviewer (invariant: all topologies
+            # include a reviewer agent)
+            return RoutingResult(
+                pattern="debate",
+                agent_count=4,
+                role_assignments=[
+                    {"role": "researcher", "model": "sonnet", "purpose": "Creative exploration (advocate)"},
+                    {"role": "researcher", "model": "sonnet", "purpose": "Creative exploration (challenger)"},
+                    {"role": "researcher", "model": "sonnet", "purpose": "Creative synthesis (judge)"},
+                    {"role": "reviewer", "model": "sonnet", "purpose": "mandatory review"},
+                ],
+                inject_scout=False,  # Debate handles novelty internally
+                rationale="Unprecedented + pure exploration + high/critical -> debate topology",
+            )
+
         # Hierarchical team: default for complex/coupled tasks
         team_size = 3  # orchestrator + worker + reviewer
         if analysis.scale == Scale.LARGE or analysis.quality_criticality in (
@@ -356,6 +394,93 @@ class TopologyRouter:
         else:
             # Mixed: first worker implements, second researches
             return "implementer" if index == 0 else "researcher"
+
+    def _consult_archive(self, task: "Task") -> str | None:
+        """Consult MAP-Elites archive for topology hint.
+
+        Returns topology pattern name if archive has a mature entry,
+        None otherwise (caller should fall back to heuristics).
+
+        DR-Issue-6-FIX: Method name is _consult_archive (consistent with call site).
+        FM-P7-061-FIX: Task type vocabulary matches archive vocabulary.
+
+        NOTE: Currently returns None in practice because _extract_config()
+        in MAPElitesArchive does not store a "topology" key. This method
+        provides the integration point for Phase 8, where archive entries
+        will include topology metadata from successful evolution records.
+        """
+        if self._archive is None:
+            return None
+
+        # Map task to archive coordinates
+        task_type = self._infer_task_type(task)
+        complexity = self._infer_complexity(task)
+
+        config = self._archive.get_best_config(task_type, complexity)
+        if config is None:
+            return None
+
+        # DR-Issue-6-FIX: Extract topology from config's "topology" key
+        topology = config.get("topology")
+        if topology is None:
+            return None
+
+        # Only accept known patterns (FM-P7-08)
+        known_patterns = {"solo", "pipeline", "parallel_swarm", "hierarchical_team", "debate"}
+        if topology not in known_patterns:
+            logger.warning(
+                f"Archive returned unknown topology '{topology}' for "
+                f"task_type={task_type}, complexity={complexity} — ignoring"
+            )
+            return None
+        return topology
+
+    def _infer_task_type(self, task: "Task") -> str:
+        """Infer task type from task metadata for archive lookup.
+
+        FM-P7-061-FIX: Returns values from the archive's task_type vocabulary.
+        The archive vocabulary is defined in core/evolution.yaml under
+        archive.task_types. The default vocabulary is:
+        ["research", "feature", "bugfix", "refactor", "creative", "meta"]
+
+        Note: "engineering" from v0.1.0 is replaced with "feature" to match
+        the archive vocabulary. Unmapped tasks default to "feature".
+        """
+        text = f"{task.title} {task.description}".lower()
+        words = set(text.split())
+
+        research_keywords = {"research", "analyze", "investigate", "review", "literature"}
+        creative_keywords = {"creative", "brainstorm", "novel", "innovative", "design"}
+        meta_keywords = {"framework", "evolve", "improve", "optimize"}
+        refactor_keywords = {"refactor", "cleanup", "reorganize", "restructure"}
+        bugfix_keywords = {"bug", "fix", "error", "broken", "crash", "regression"}
+
+        if research_keywords & words:
+            return "research"
+        if creative_keywords & words:
+            return "creative"
+        if meta_keywords & words:
+            return "meta"
+        if refactor_keywords & words:
+            return "refactor"
+        if bugfix_keywords & words:
+            return "bugfix"
+        return "feature"  # FM-P7-061-FIX: "feature" not "engineering"
+
+    def _infer_complexity(self, task: "Task") -> str:
+        """Infer complexity from task for archive lookup.
+
+        FM-P7-062-FIX: Returns archive vocabulary values
+        ("simple", "moderate", "complex"). "extreme" requires explicit tagging.
+        """
+        text = f"{task.title} {task.description}".lower()
+        word_count = len(text.split())
+
+        if word_count > 200:
+            return "complex"
+        elif word_count > 50:
+            return "moderate"
+        return "simple"
 
     def _log_routing_decision(
         self, task: Task, analysis: TaskAnalysis, result: RoutingResult

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..models.audit import (
     BaseLogEntry,
+    CreativityLogEntry,
     DecisionLogEntry,
     DiversityLogEntry,
     EnvironmentLogEntry,
@@ -57,6 +58,10 @@ class AuditLogger:
 
     def log_trace(self, entry: TraceLogEntry) -> None:
         self.writers[LogStream.TRACES].append(entry)
+
+    def log_creativity(self, entry: CreativityLogEntry) -> None:
+        """Log a creativity engine event — Phase 6."""
+        self.writers[LogStream.CREATIVITY].append(entry)
 
     def log_governance(
         self,

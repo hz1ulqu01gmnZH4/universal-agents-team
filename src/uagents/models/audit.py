@@ -126,3 +126,24 @@ class GovernanceLogEntry(BaseLogEntry):
     risk_aggregate: float = 0.0
     alignment_passed: bool = True
     detail: str = ""
+
+
+class CreativityLogEntry(BaseLogEntry):
+    """Creativity engine audit log entry — Phase 6.
+
+    Tracks creative session lifecycle: creation, evaluation, metrics.
+    Uses the CREATIVITY log stream (not EVOLUTION/governance).
+    """
+
+    stream: Literal[LogStream.CREATIVITY] = LogStream.CREATIVITY
+    event_type: str  # "creative_session_created", "creative_session_evaluated"
+    session_id: str = ""
+    task_id: str = ""
+    trigger_type: str = ""
+    agent_count: int = 0
+    guilford_fluency: int = 0
+    guilford_flexibility: int = 0
+    guilford_originality: float = 0.0
+    guilford_elaboration: float = 0.0
+    vdi_score: float = 0.0
+    detail: str = ""

@@ -27,6 +27,7 @@ class DirectoryManager:
         "shared/skills/",
         "shared/tools/",
         "shared/archive/",
+        "shared/domain-switches/",
         "tools/",
         "tests/",
     ]
@@ -56,6 +57,14 @@ class DirectoryManager:
         "state/governance/alignment_reports/",
         "state/governance/risk_assessments/",
         "state/governance/pending_human_decisions/",
+        # Phase 7: Scout directories
+        "state/scouts/",
+        "state/scouts/targets/",
+        "state/scouts/reports/",
+        # Phase 6: Creativity directories
+        "state/creativity/",
+        "state/creativity/sessions/",
+        "state/creativity/evaluations/",
         "state/coordination/",
         "state/coordination/pressure-fields/",
         "logs/",

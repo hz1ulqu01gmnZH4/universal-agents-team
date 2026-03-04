@@ -65,6 +65,17 @@ class MAPElitesArchive:
         # Load or initialize state
         self._state = self._load_state()
 
+    # DR-Issue-18-FIX: Public accessor properties for archive dimensions
+    @property
+    def task_types(self) -> list[str]:
+        """Public accessor for archive task type vocabulary."""
+        return list(self._task_types)
+
+    @property
+    def complexities(self) -> list[str]:
+        """Public accessor for archive complexity vocabulary."""
+        return list(self._complexities)
+
     def update_from_evolution(self, record: EvolutionRecord) -> bool:
         """Update archive with a successful evolution.
 
@@ -230,6 +241,27 @@ class MAPElitesArchive:
             "total_evaluations": self._state.total_evaluations,
             "total_replacements": self._state.total_replacements,
         }
+
+    def get_underexplored_cells(self, min_task_count: int = 3) -> list[tuple[str, str]]:
+        """Return cells with fewer than min_task_count evaluations.
+
+        Returns list of (task_type, complexity) tuples.
+        """
+        underexplored: list[tuple[str, str]] = []
+        for cell in self._state.cells:
+            if cell.task_count < min_task_count:
+                underexplored.append((cell.task_type, cell.complexity))
+        return underexplored
+
+    def get_unoccupied_cells(self) -> list[tuple[str, str]]:
+        """Return all cell coordinates that have no occupant."""
+        occupied = {(c.task_type, c.complexity) for c in self._state.cells}
+        unoccupied: list[tuple[str, str]] = []
+        for task_type in self._task_types:
+            for complexity in self._complexities:
+                if (task_type, complexity) not in occupied:
+                    unoccupied.append((task_type, complexity))
+        return unoccupied
 
     # ── Private helpers ──
 

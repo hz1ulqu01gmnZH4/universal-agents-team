@@ -30,14 +30,18 @@ if TYPE_CHECKING:
     from .capability_tracker import CapabilityTracker
     from .context_pressure_monitor import ContextPressureMonitor
     from .cost_gate import CostGate
+    from .creativity_engine import CreativityEngine
     from .diversity_engine import DiversityEngine
+    from .domain_manager import DomainManager
     from .evolution_engine import EvolutionEngine
     from .objective_anchor import ObjectiveAnchor
+    from .pressure_field import PressureFieldCoordinator
     from .prompt_composer import PromptComposer
     from .quorum_manager import QuorumManager
     from .rate_limiter import RateLimiter
     from .ring_enforcer import RingEnforcer
     from .risk_scorecard import RiskScorecard
+    from .scout_spawner import ScoutSpawner
     from .self_reconfigurer import SelfReconfigurer
     from .skill_library import SkillLibrary
     from .stagnation_detector import StagnationDetector
@@ -96,6 +100,12 @@ class Orchestrator:
         objective_anchor: ObjectiveAnchor | None = None,
         risk_scorecard: RiskScorecard | None = None,
         alignment_verifier: AlignmentVerifier | None = None,
+        # Phase 6: Creativity engine
+        creativity_engine: CreativityEngine | None = None,
+        # Phase 7: Self-expansion
+        scout_spawner: ScoutSpawner | None = None,
+        pressure_field_coordinator: PressureFieldCoordinator | None = None,
+        domain_manager: DomainManager | None = None,
     ):
         self.yaml_store = yaml_store
         self.topology_router = topology_router
@@ -125,6 +135,11 @@ class Orchestrator:
         self._objective_anchor = objective_anchor
         self._risk_scorecard = risk_scorecard
         self._alignment_verifier = alignment_verifier
+        self._creativity_engine = creativity_engine
+        # Phase 7: Self-expansion
+        self._scout_spawner = scout_spawner
+        self._pressure_field_coordinator = pressure_field_coordinator
+        self._domain_manager = domain_manager
 
         # Phase 3.5: Verify Ring 0 integrity at boot (if enforcer provided)
         if self._ring_enforcer is not None:
@@ -197,7 +212,7 @@ class Orchestrator:
                 TopologyAssignment(
                     role=a["role"],
                     agent_id="pending",  # Filled when team spawns agents
-                    model=ModelPreference(a.get("model", "sonnet")),
+                    model=ModelPreference(a["model"]),  # IFM-N53: router guarantees this
                 )
                 for a in routing.role_assignments
             ],
@@ -439,7 +454,127 @@ class Orchestrator:
                     health_status=srd.health_status,
                 ))
 
+            # Phase 6: Check creativity trigger
+            # FM-P6-48-FIX: scoped inside diversity_engine block for stagnation_signals access.
+            # FM-P6-17-FIX: Use `results` (the dict defined at top of method).
+            # FM-P6-IMP-010/011-FIX: Always check creativity trigger when engine is
+            # available — stagnation is only one activation path; task tags, conventional
+            # failure, and human requests should also be checked.
+            if self._creativity_engine is not None:
+                creativity_info = self._check_creativity_trigger(
+                    task_id=task_id,
+                    stagnation_signals=stagnation_signals,
+                )
+                if creativity_info is not None:
+                    results["creativity_session"] = creativity_info
+
+        # Phase 7: Scout spawning check — OUTSIDE diversity block so solo
+        # tasks can trigger scouts via framework-level stagnation.
+        # FM-P7-067-FIX / DR-Issue-15-FIX
+        if self._scout_spawner is not None:
+            # Collect stagnation signals (may be from diversity block or empty)
+            scout_stagnation = results.get("stagnation_signals", [])
+            # For solo tasks, run framework-level stagnation check directly
+            if not scout_stagnation and self.stagnation_detector is not None:
+                fw_signals = self.stagnation_detector.check_framework_stagnation()
+                scout_stagnation = [s.model_dump() for s in fw_signals]
+
+            # DR-Issue-22-FIX: Budget pressure check for scout spawning
+            skip_scout = False
+            if self.budget_tracker is not None:
+                pressure = self.budget_tracker.get_pressure()
+                if pressure in (BudgetPressureLevel.RED, BudgetPressureLevel.ORANGE):
+                    logger.info(
+                        f"Skipping scout spawn for task {task_id}: "
+                        f"budget pressure is {pressure}"
+                    )
+                    skip_scout = True
+
+            if not skip_scout and scout_stagnation:
+                # FM-P7-IMP-019-FIX: Check metric_name, not just level.
+                # Team-level signals include VDI stagnation too — only SRD
+                # signals should trigger the diversity floor scout.
+                srd_below_floor = any(
+                    s.get("metric_name") == "srd" for s in scout_stagnation
+                )
+                targets = self._scout_spawner.generate_targets(
+                    stagnation_signals=scout_stagnation,
+                    srd_below_floor=srd_below_floor,
+                )
+                if targets:
+                    # Save the highest-priority target
+                    self._scout_spawner.save_target(targets[0])
+                    results["scout_target"] = {
+                        "target_id": targets[0].id,
+                        "target_type": str(targets[0].target_type),
+                        "description": targets[0].description,
+                        "priority": targets[0].priority,
+                    }
+
         return results
+
+    def _check_creativity_trigger(
+        self,
+        task_id: str,
+        stagnation_signals: list,
+        task_tags: list[str] | None = None,
+        conventional_failed: bool = False,
+    ) -> dict | None:
+        """Check if creativity engine should activate and create session.
+
+        Called from record_task_outcome() when stagnation signals are present,
+        or from process_task() for tagged-novel tasks.
+
+        Returns:
+            Dict with session info if activated, None otherwise.
+        """
+        if self._creativity_engine is None:
+            return None
+
+        # FM-P6-40-FIX: Skip creativity under RED/ORANGE budget pressure
+        if self.budget_tracker is not None:
+            pressure = self.budget_tracker.get_pressure()
+            if pressure in (BudgetPressureLevel.RED, BudgetPressureLevel.ORANGE):
+                logger.info(
+                    f"Skipping creativity trigger for task {task_id}: "
+                    f"budget pressure is {pressure}"
+                )
+                return None
+
+        # FM-P6-25-FIX: Lossless conversion via model_dump() preserves all fields
+        signal_dicts = [
+            s.model_dump() if hasattr(s, "model_dump") else s
+            for s in stagnation_signals
+        ] if stagnation_signals else []
+
+        trigger = self._creativity_engine.should_activate(
+            stagnation_signals=signal_dicts,
+            task_tags=task_tags,
+            conventional_failed=conventional_failed,
+        )
+
+        if trigger is None:
+            return None
+
+        trigger.task_id = task_id
+        session = self._creativity_engine.create_session(
+            task_id=task_id,
+            trigger=trigger,
+        )
+
+        logger.info(
+            f"Creativity engine activated for task {task_id}: "
+            f"session {session.id}, trigger={trigger.trigger_type}"
+        )
+        return {
+            "session_id": session.id,
+            "trigger_type": trigger.trigger_type,
+            "agent_count": session.agent_count,
+            "assignments": [
+                {"persona": a.persona_atom, "tone": a.tone_atom}
+                for a in session.assignments
+            ],
+        }
 
     def _load_agent(self, agent_id: str) -> AgentRegistryEntry | None:
         """Load agent registry entry by ID. Returns None if not found."""
@@ -690,8 +825,9 @@ For each subtask, provide:
             data = self.yaml_store.read_raw(rel_path)
         except FileNotFoundError:
             return False
-        proposal = data.get("proposal", {})
-        tier = proposal.get("tier")
+        # IFM-N53: fail-loud — evolution records must have proposal.tier
+        proposal = data["proposal"]
+        tier = proposal["tier"]
         # Tier 2 = organizational, also catch higher tiers
         if isinstance(tier, int):
             return tier >= 2
@@ -725,7 +861,7 @@ For each subtask, provide:
                 agent_data.append({
                     "agent_id": agent_id,
                     "role": role,
-                    "capabilities": data.get("capabilities", []),
+                    "capabilities": data["capabilities"],  # IFM-N53: fail-loud
                     # Phase 5: behavioral metrics not yet collected.
                     # Marked absent so checks can skip vs. false-pass.
                     "_metrics_available": False,
