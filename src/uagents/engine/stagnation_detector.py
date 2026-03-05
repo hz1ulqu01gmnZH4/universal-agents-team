@@ -39,6 +39,8 @@ SRD_CONSECUTIVE_THRESHOLD = 3
 FRAMEWORK_EVOLUTION_THRESHOLD = 10  # No Tier 2+ evo in this many tasks
 FRAMEWORK_TOPOLOGY_THRESHOLD = 10   # Same topology for this many tasks
 ARCHIVE_STALENESS_THRESHOLD = 20    # No MAP-Elites cell replacement in this many tasks
+# Phase 8: Single-fork evolution stall detection
+SINGLE_FORK_STALL_THRESHOLD = 3     # N consecutive rejected evolutions → suggest population mode
 
 
 class StagnationDetector:
@@ -66,6 +68,8 @@ class StagnationDetector:
         self._tone_history: deque[set[str]] = deque(maxlen=20)
         self._tasks_since_evolution: int = 0
         self._tasks_since_archive_update: int = 0
+        # Phase 8: consecutive evolution rejections counter
+        self._consecutive_rejections: int = 0
 
         # Load persisted state
         self._load_state()
@@ -189,6 +193,18 @@ class StagnationDetector:
         self._tasks_since_archive_update = 0
         self._save_state()
 
+    def record_evolution_outcome(self, promoted: bool) -> None:
+        """Record evolution outcome for stall detection (Phase 8).
+
+        If promoted, reset consecutive_rejections counter.
+        If rejected, increment counter.
+        """
+        if promoted:
+            self._consecutive_rejections = 0
+        else:
+            self._consecutive_rejections += 1
+        self._save_state()
+
     def _check_team_srd(self) -> StagnationSignal | None:
         """SRD < 0.4 for 3 consecutive tasks → team-level stagnation."""
         recent = list(self._srd_history)[-SRD_CONSECUTIVE_THRESHOLD:]
@@ -292,6 +308,24 @@ class StagnationDetector:
                 consecutive_count=self._tasks_since_archive_update,
             ))
 
+        # Phase 8: Single-fork evolution stall
+        # FM-104: Only fire at multiples of threshold
+        if (
+            self._consecutive_rejections >= SINGLE_FORK_STALL_THRESHOLD
+            and self._consecutive_rejections % SINGLE_FORK_STALL_THRESHOLD == 0
+        ):
+            signals.append(StagnationSignal(
+                level=StagnationLevel.FRAMEWORK,
+                description=(
+                    f"Single-fork evolution stalled: {self._consecutive_rejections} "
+                    f"consecutive_rejections. Consider population mode."
+                ),
+                metric_name="consecutive_rejections",
+                metric_value=float(self._consecutive_rejections),
+                threshold=float(SINGLE_FORK_STALL_THRESHOLD),
+                consecutive_count=self._consecutive_rejections,
+            ))
+
         # Same topology for 10 consecutive tasks
         recent_topo = list(self._topology_history)[-FRAMEWORK_TOPOLOGY_THRESHOLD:]
         if len(recent_topo) >= FRAMEWORK_TOPOLOGY_THRESHOLD:
@@ -317,6 +351,7 @@ class StagnationDetector:
             "tone_history": [list(s) for s in self._tone_history],
             "tasks_since_evolution": self._tasks_since_evolution,
             "tasks_since_archive_update": self._tasks_since_archive_update,
+            "consecutive_rejections": self._consecutive_rejections,
         }
         self.yaml_store.write_raw(f"{self._stagnation_base}/state.yaml", state)
 
@@ -341,6 +376,8 @@ class StagnationDetector:
             # FM-P7-056-FIX: FM-119 backward-compat pattern — .get() with default
             # is acceptable for state loading (older state files won't have this key)
             self._tasks_since_archive_update = int(state.get("tasks_since_archive_update", 0))
+            # Phase 8: FM-119 backward-compat — older state files won't have this
+            self._consecutive_rejections = int(state.get("consecutive_rejections", 0))
         except Exception as e:
             # FM-119: Corrupt/missing YAML — start with empty state
             if not isinstance(e, FileNotFoundError):

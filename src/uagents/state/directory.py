@@ -67,6 +67,9 @@ class DirectoryManager:
         "state/creativity/evaluations/",
         "state/coordination/",
         "state/coordination/pressure-fields/",
+        # Phase 8: Population evolution directories
+        "state/evolution/populations/",
+        "state/evolution/held/",
         "logs/",
         "logs/evolution/",
         "logs/tasks/",

@@ -275,13 +275,27 @@ class MAPElitesArchive:
         return None
 
     def _extract_config(self, record: EvolutionRecord) -> dict[str, str]:
-        """Extract configuration dict from an evolution record."""
-        return {
+        """Extract configuration dict from an evolution record.
+
+        Phase 8 addition: topology and agent_count from evidence (additive).
+        """
+        config: dict[str, str] = {
             "component": record.proposal.component,
+            "tier": str(record.proposal.tier),
             "diff_summary": record.proposal.diff[:200],
             "rationale": record.proposal.rationale,
             "evolution_id": record.id,
         }
+
+        # Phase 8: topology from evidence (M-05 fix — additive only)
+        if record.proposal.evidence:
+            evidence = record.proposal.evidence
+            if "topology" in evidence:
+                config["topology"] = str(evidence["topology"])
+            if "agent_count" in evidence:
+                config["agent_count"] = str(evidence["agent_count"])
+
+        return config
 
     def _load_state(self) -> MAPElitesState:
         """Load archive state from disk. Create empty if missing."""

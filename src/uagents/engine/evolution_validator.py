@@ -100,6 +100,16 @@ class EvolutionValidator:
         self._promote_threshold = float(ev["promote_threshold"])
         self._hold_threshold = float(ev["hold_threshold"])
 
+    def _refresh_thresholds(self) -> None:
+        """Re-read thresholds from config (FM-P8-017 fix).
+
+        Called at the start of each evaluate() to pick up gap calibration changes.
+        """
+        config_raw = self.yaml_store.read_raw("core/evolution.yaml")
+        eval_cfg = config_raw["evolution"]["evaluation"]
+        self._promote_threshold = float(eval_cfg["promote_threshold"])
+        self._hold_threshold = float(eval_cfg["hold_threshold"])
+
     def evaluate(
         self,
         candidate: DualCopyCandidate,
@@ -125,6 +135,9 @@ class EvolutionValidator:
         Returns:
             EvaluationResult with per-dimension scores, overall score, and verdict.
         """
+        # FM-P8-017: Re-read thresholds to pick up gap calibration changes
+        self._refresh_thresholds()
+
         now = datetime.now(timezone.utc)
         dimension_scores: list[DimensionScore] = []
 

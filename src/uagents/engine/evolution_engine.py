@@ -51,7 +51,12 @@ from .constitution_guard import ConstitutionGuard
 from .dual_copy_manager import DualCopyManager, ForkError, PromotionError
 from .evolution_validator import EvolutionValidator
 from .map_elites_archive import MAPElitesArchive
+from .gap_monitor import GapMonitor
+from .population_evolver import PopulationEvolver, PopulationError
 from .ring_enforcer import RingEnforcer, RingViolationError
+from .stagnation_detector import StagnationDetector
+
+from ..models.population import GapCalibrationAction, PopulationOutcome
 
 # Phase 5: Governance imports (conditional — works even if not installed)
 try:
@@ -149,6 +154,10 @@ class EvolutionEngine:
         objective_anchor: ObjectiveAnchor | None = None,
         risk_scorecard: RiskScorecard | None = None,
         alignment_verifier: AlignmentVerifier | None = None,
+        # Phase 8: Population evolution components
+        population_evolver: PopulationEvolver | None = None,
+        gap_monitor: GapMonitor | None = None,
+        stagnation_detector: StagnationDetector | None = None,
     ):
         self.yaml_store = yaml_store
         self.git_ops = git_ops
@@ -164,6 +173,10 @@ class EvolutionEngine:
         self._objective_anchor = objective_anchor
         self._risk_scorecard = risk_scorecard
         self._alignment_verifier = alignment_verifier
+        # Phase 8: Population evolution components
+        self._population_evolver = population_evolver
+        self._gap_monitor = gap_monitor
+        self._stagnation_detector = stagnation_detector
 
         # Load config (fail-loud if missing)
         config_raw = yaml_store.read_raw("core/evolution.yaml")
@@ -1289,3 +1302,293 @@ class EvolutionEngine:
             f"Evolution {held_record.id} PROMOTED via quorum: {approved_by}"
         )
         return held_record
+
+    # ------------------------------------------------------------------
+    # Phase 8: Population-based evolution
+    # ------------------------------------------------------------------
+
+    def run_population_evolution(
+        self,
+        proposal: EvolutionProposal,
+        population_size: int | None = None,
+    ) -> EvolutionRecord:
+        """Run population-based evolution for a proposal.
+
+        Generates multiple candidates, evaluates all, selects best.
+        If winner meets promote threshold, promotes it through the
+        existing single-fork pipeline (Steps 5-8: approve→commit→verify→log).
+
+        Args:
+            proposal: Base proposal to generate variants from.
+            population_size: Number of candidates (default from config).
+
+        Returns:
+            EvolutionRecord with outcome.
+
+        Raises:
+            EvolutionError: If population evolver not configured.
+            PopulationError: On non-recoverable population failures.
+        """
+        if self._population_evolver is None:
+            raise EvolutionError(
+                "Population evolution requires PopulationEvolver. "
+                "Configure it in EvolutionEngine constructor."
+            )
+        if self._gap_monitor is None:
+            raise EvolutionError(
+                "Population evolution requires GapMonitor. "
+                "Configure it in EvolutionEngine constructor."
+            )
+        if self._stagnation_detector is None:
+            raise EvolutionError(
+                "Population evolution requires StagnationDetector. "
+                "Configure it in EvolutionEngine constructor."
+            )
+
+        now = datetime.now(timezone.utc)
+
+        # FM-P4-48-FIX: Check persistent pause flag
+        if self._state.paused:
+            return self._reject(
+                proposal,
+                f"Evolution paused: {self._state.pause_reason}",
+                now,
+            )
+
+        # FM-P8-006: Tier/safety/constitutional checks before population run
+        tier_int = int(proposal.tier)
+        if tier_int == EvolutionTier.CONSTITUTIONAL:
+            return self._reject(
+                proposal,
+                "Tier 0 (constitutional) evolution is NEVER allowed.",
+                now,
+            )
+        if tier_int == EvolutionTier.FRAMEWORK:
+            return self._reject(
+                proposal,
+                "Tier 1 (framework) proposals cannot use population mode.",
+                now,
+            )
+
+        safety_ok, safety_reason = self._check_proposal_safety(proposal)
+        if not safety_ok:
+            return self._reject(proposal, safety_reason, now)
+
+        const_ok, const_reason = self.constitution_guard.check_proposal(proposal)
+        if not const_ok:
+            return self._reject(
+                proposal, f"Constitutional: {const_reason}", now,
+                constitutional_failure=True,
+            )
+
+        try:
+            yaml.safe_load(proposal.diff)
+        except yaml.YAMLError as e:
+            return self._reject(proposal, f"Diff is not valid YAML: {e}", now)
+
+        # Run population — returns winner fork alive (M-01/FM-P8-013 fix)
+        pop_run, winner_fork, winner_proposal = (
+            self._population_evolver.run_population(
+                base_proposal=proposal,
+                population_size=population_size,
+            )
+        )
+
+        try:
+            if pop_run.outcome == PopulationOutcome.PROMOTED:
+                # Winner fork is alive — promote with full safety pipeline
+                winner_result = next(
+                    c for c in pop_run.candidates
+                    if c.candidate_id == pop_run.winner_id
+                )
+
+                # Step 6: COMMIT — rollback point, promote, git commit
+                rollback_sha = self.git_ops.create_rollback_point()
+
+                evolution_sha = ""
+                try:
+                    self.dual_copy_manager.promote(winner_fork)
+
+                    git_files = self._git_paths(winner_fork)
+                    tier_val = winner_proposal.tier
+                    tier_int = tier_val if isinstance(tier_val, int) else int(tier_val)
+                    evolution_sha = self.git_ops.commit_evolution(
+                        evo_id=winner_proposal.id,
+                        tier=tier_int,
+                        rationale=winner_proposal.rationale,
+                        approved_by="population_tournament",
+                        files=git_files,
+                    )
+                except (GitOpsError, PromotionError) as e:
+                    logger.error(
+                        f"Population commit failed for {proposal.id}: {e}"
+                    )
+                    if winner_fork.promoted:
+                        try:
+                            self.git_ops.rollback_to(rollback_sha)
+                        except GitOpsError as re:
+                            self._state.paused = True
+                            self._state.pause_reason = (
+                                f"CRITICAL: Population commit failed AND rollback "
+                                f"failed for {proposal.id}. Commit: {e}. "
+                                f"Rollback: {re}"
+                            )
+                            self._save_state()
+                            raise EvolutionError(
+                                f"Population commit failed for {proposal.id} AND "
+                                f"rollback to {rollback_sha} failed: {re}. "
+                                f"Evolution paused."
+                            ) from re
+                    return self._reject(
+                        proposal,
+                        f"Population commit failed: {e}",
+                        now,
+                    )
+
+                # Step 7: VERIFY — Ring 0 check + post-commit checks
+                git_files = self._git_paths(winner_fork)
+                try:
+                    self.ring_enforcer.verify_no_ring_0_modification(git_files)
+                    ring_check_passed = True
+                except RingViolationError as e:
+                    logger.error(
+                        f"Ring 0 violation in population evolution "
+                        f"{proposal.id}: {e}"
+                    )
+                    ring_check_passed = False
+
+                verification_ok = self._verify_post_commit() and ring_check_passed
+
+                if not verification_ok:
+                    if evolution_sha and evolution_sha != rollback_sha:
+                        logger.error(
+                            f"Population post-commit verification failed for "
+                            f"{proposal.id}. Rolling back to {rollback_sha[:8]}."
+                        )
+                        try:
+                            self.git_ops.rollback_to(rollback_sha)
+                        except GitOpsError as e:
+                            self._state.paused = True
+                            self._state.pause_reason = (
+                                f"CRITICAL: Population verification failed AND "
+                                f"rollback failed for {proposal.id}."
+                            )
+                            self._save_state()
+                            raise EvolutionError(
+                                f"Population verification failed for "
+                                f"{proposal.id} AND rollback failed: {e}. "
+                                f"Evolution paused."
+                            ) from e
+                    return self._reject(
+                        proposal,
+                        f"Population post-commit verification failed",
+                        now,
+                    )
+
+                # Step 8: LOG — create record, update archive, track metrics
+                # Create synthetic EvaluationResult from winner's scores
+                # (_log_outcome requires evaluation on non-rejected records)
+                winner_eval = EvaluationResult(
+                    id=winner_result.evaluation_id or generate_id("eval"),
+                    created_at=now,
+                    proposal_id=winner_proposal.id,
+                    candidate_id=winner_result.candidate_id,
+                    overall_score=winner_result.overall_score,
+                    verdict=EvolutionOutcome.PROMOTED,
+                )
+                record = EvolutionRecord(
+                    id=generate_id("evo-rec"),
+                    created_at=now,
+                    proposal=winner_proposal,
+                    evaluation=winner_eval,
+                    outcome=EvolutionOutcome.PROMOTED,
+                    approved_by="population_tournament",
+                    constitutional_check="pass",
+                    rollback_commit=rollback_sha,
+                    evolution_commit=evolution_sha,
+                    verification_passed=True,
+                )
+                self._persist_record(record)
+                self._log_outcome(record)
+
+                # Update archive (narrowed to IO/data errors)
+                try:
+                    self.archive.update_from_evolution(record)
+                except (OSError, ValueError, yaml.YAMLError) as e:
+                    logger.error(
+                        f"Population archive update failed for {record.id}: {e}"
+                    )
+
+                # S-CR-03-FIX: Increment evolution count only on PROMOTED
+                self._state.evolution_count += 1
+                self._state.tasks_since_last_evolution = 0
+                self._save_state()
+
+                # Gap monitor + calibration check
+                self._gap_monitor.record_promotion()
+                action = self._gap_monitor.check_calibration()
+                if action != GapCalibrationAction.HOLD:
+                    self._gap_monitor.apply_calibration(action)
+
+                # Wire stagnation detector (FM-P8-035 fix)
+                self._stagnation_detector.record_evolution_outcome(
+                    promoted=True
+                )
+
+                return record
+
+            elif pop_run.outcome == PopulationOutcome.HELD:
+                # FM-P8-028: HELD has dedicated handling
+                # Create synthetic evaluation for audit log
+                held_eval = EvaluationResult(
+                    id=generate_id("eval"),
+                    created_at=now,
+                    proposal_id=proposal.id,
+                    candidate_id=pop_run.winner_id or "",
+                    overall_score=0.0,
+                    verdict=EvolutionOutcome.HELD,
+                    verdict_reason=pop_run.reason,
+                )
+                record = EvolutionRecord(
+                    id=generate_id("evo-rec"),
+                    created_at=now,
+                    proposal=proposal,
+                    evaluation=held_eval,
+                    outcome=EvolutionOutcome.HELD,
+                    approved_by="population_held",
+                    constitutional_check="pass",
+                    rollback_commit="",
+                    verification_passed=False,
+                )
+                self._persist_record(record)
+                self._log_outcome(record)
+                # Persist to held queue for human review
+                held_path = f"{self._base}/held/{record.id}.yaml"
+                self.yaml_store.write(held_path, record)
+                logger.info(
+                    f"Population evolution held for review: {record.id}"
+                )
+                return record
+
+            else:
+                # ALL_REJECTED or CANCELLED
+                self._gap_monitor.record_rejection()
+                self._stagnation_detector.record_evolution_outcome(
+                    promoted=False
+                )
+                return self._reject(
+                    proposal,
+                    f"Population evolution: {pop_run.reason}",
+                    now,
+                )
+
+        finally:
+            # Always cleanup winner fork (whether promoted or not)
+            if winner_fork is not None:
+                try:
+                    self.dual_copy_manager.cleanup_fork(winner_fork)
+                except OSError as e:
+                    logger.error(
+                        f"Failed to cleanup winner fork "
+                        f"{winner_fork.evo_id}: {e}"
+                    )
