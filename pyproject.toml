@@ -16,6 +16,9 @@ dev = [
     "pytest-cov>=6.0",
 ]
 
+[project.scripts]
+uagents = "uagents.cli.bootstrap:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
